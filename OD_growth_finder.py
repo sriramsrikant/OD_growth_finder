@@ -2,19 +2,20 @@ import pandas as pd
 import numpy as np
 from scipy import interpolate, signal, stats
 import bisect
-#from scipy.interpolate import UnivariateSpline
-# import scipy as sp
 import matplotlib.pyplot as plt
 import datetime as datetime
+import os, argparse
+
 
 def reformat_time(x):
     """Assumes x is a datetime.time object."""
     time_in_seconds = (60.*60.*x.hour + 60*x.minute + x.second)
     return time_in_seconds/(60.) # return time in minutes for computation of doubling time in minutes
 
+
 class OD_growth_experiment(object):
 
-    def __init__(self, path_to_data, blank, method, output_path = './', organism):
+    def __init__(self, path_to_data, blank, method, organism, out_dir):
         self.path_to_data = path_to_data
         self.data = pd.read_excel(path_to_data) # not sure if read_csv might be better
         # Drop the rows that have NAN's, usually at the end
@@ -22,6 +23,7 @@ class OD_growth_experiment(object):
         self.sample_list = []
         self.method = method
         self.organism = organism
+        self.out_dir = out_dir
 
         # Get the times from the data - check for format and reformat if necessary
         self.times = self.data.iloc[:,0] # just assume first column is time data
@@ -36,9 +38,6 @@ class OD_growth_experiment(object):
         if type(blank) == 'str':
             self.blank = self.data.mean()[blank] # if blank input is well, blank is average value of that well
         else: self.blank = blank
-
-        # Set the output path
-        self.output_path = output_path
 
         # Set the default s for fitting...deals with how close the fit is to the points
         #self.s = s
@@ -70,37 +69,43 @@ class Sample(object):
     def __init__(self, experiment, name, data):
         self.experiment = experiment # now ref attributes as self.experiment.attr
         self.elapsed_time = self.experiment.elapsed_time
+        self.out_dir = self.experiment.out_dir
         self.name = name
         self.raw_data = data
         # self.cal_data = self.raw_data - self.experiment.blank # subtract blank value, shouldn't be necessary...
         self.log_data = np.log(self.raw_data) # Log of the calibrated OD
 
         # get max OD and time of max_OD
-        max_OD_index = np.argmax(self.raw_data)
-        self.max_OD = self.raw_data[max_OD_index]
-        self.time_of_max_OD = self.elapsed_time[max_OD_index]
+        self.max_OD_index = np.argmax(self.raw_data)
+        self.max_OD = self.raw_data[self.max_OD_index]
+        self.time_of_max_OD = self.elapsed_time[self.max_OD_index]
 
     def spline_max_growth_rate(self):
 
-        interpolator = interpolate.UnivariateSpline(self.elapsed_time, self.log2_data, k=4, s=0.05) #k can be 3-5
+        interpolator = interpolate.UnivariateSpline(self.elapsed_time, self.log_data, k=4, s=0.05) #k can be 3-5
         der = interpolator.derivative()
 
         # Get the approximation of the derivative at all points
         der_approx = der(self.elapsed_time)
 
         # Get the maximum
-        maximum_index = np.argmax(der_approx)
-        self.maximum_rate = der_approx[maximum_index]
-        self.time_of_max_rate = self.elapsed_time[maximum_index]
+        self.maximum_index = np.argmax(der_approx)
+        self.maximum_rate = der_approx[self.maximum_index]
+        self.time_of_max_rate = self.elapsed_time[self.maximum_index]
+        print self.name, self.maximum_rate, self.time_of_max_rate
 
         # Get estimates of lag time and saturation time from 2nd derivative
         der2 = der.derivative()
         der2_approx = der2(self.elapsed_time)
-        lag_index = signal.argrelmax(der2_approx)[0][0] # find first max
-        self.lag_time = self.elapsed_time[lag_index]
+        try: self.lag_index = signal.argrelmax(der2_approx)[0][0] # find first max
+        except: self.lag_index = 2
+        self.lag_time = self.elapsed_time[self.lag_index]
         minima = signal.argrelmin(der2_approx)[0]
-        sat_index = minima[bisect.bisect(minima,lag_index)] # find first min after lag_index
-        self.sat_time = self.elapsed_time[sat_index]
+        which_min = bisect.bisect(minima,self.lag_index)
+        print self.lag_index, minima, which_min
+        try: self.sat_index = minima[which_min]
+        except: self.sat_index = 90# find first min after lag_index
+        self.sat_time = self.elapsed_time[self.sat_index]
 
         self.fit_y_values = interpolator(self.elapsed_time)
 
@@ -113,12 +118,13 @@ class Sample(object):
         elif self.experiment.organism == 'bacteria':
             window_size = int(1.5*20/interval)
         else: window_size = 5 # print "I don't know what organism you are using. Here's some data anyway."
-        window_times = self.elapsed_time[:window_size] # always use first time points
+        #window_times = self.elapsed_time[:window_size] # always use first time points
 
         rates = []
         intercepts = []
         num_windows = len(self.log_data)-window_size+1
         for i in range(0, num_windows):
+            window_times = self.elapsed_time[i:i+window_size]
             sub_data = self.log_data[i:i+window_size] # now use this sub_data to fit a line (not exp since we have the log2 data)
             results = stats.linregress(window_times, sub_data) # get fit parameters
             # save b parameter
@@ -126,14 +132,17 @@ class Sample(object):
             intercepts.append(results[1])
 
         self.maximum_rate = max(rates) # get max rate
-        maximum_index = rates.index(self.maximum_rate) + int(window_size/2) # returns midpoint of time window for max rate
-        self.time_of_max_rate = self.elapsed_time[maximum_index]
+        self.maximum_index = rates.index(self.maximum_rate) + int(window_size/2) # returns midpoint of time window for max rate
+        self.time_of_max_rate = self.elapsed_time[self.maximum_index]
 
         # get lag_time and saturation_time parameters - how? from slope-intercept of max slope
-        intercept_max = intercepts[maximum_index]
+        intercept_max = intercepts[self.maximum_index]
         self.lag_time = -(intercept_max) / self.maximum_rate # find x where y = 0
+        self.lag_index = int(self.lag_time/interval)
+        if self.lag_index > self.maximum_index: self.lag_index = 2
         self.sat_time = (self.max_OD - intercept_max) / self.maximum_rate # find x where y = max_OD
-
+        self.sat_index = int(self.sat_time/interval)
+        if self.sat_index > len(self.elapsed_time): self.sat_index = len(self.elapsed_time) - 1
         self.fit_y_values = [(self.maximum_rate*x + intercept_max) for x in self.elapsed_time]
 
     def plot_growth_parameters(self):
@@ -142,27 +151,30 @@ class Sample(object):
         # orig data with points marked for max growth, lag time, saturation time, and max OD
         orig = fig.add_subplot(211)
         orig.plot(self.elapsed_time, self.raw_data, ls='', marker='.', label='raw data')
-        orig.plot(self.time_of_max_rate, self.raw_data[self.time_of_max_rate], 'ro', label='max growth', alpha=0.5)
-        orig.plot(self.lag_time, self.raw_data[self.lag_time], 'bo', label='lag time')
-        orig.plot(self.sat_time, self.raw_data[self.sat_time], 'go', label='saturation time')
-        orig.plot(self.time_of_max_OD, self.raw_data[self.time_of_max_OD], 'ko', label='max OD')
+        orig.plot(self.time_of_max_rate, self.raw_data[self.maximum_index], 'ro', label='max growth')
+        orig.plot(self.elapsed_time[self.lag_index], self.raw_data[self.lag_index], 'bo', label='lag time')
+        orig.plot(self.elapsed_time[self.sat_index], self.raw_data[self.sat_index], 'go', label='saturation time')
+        orig.plot(self.time_of_max_OD, self.raw_data[self.max_OD_index], 'ko', label='max OD')
 
-        orig.xlabel('elapsed time (minutes)')
-        orig.ylabel('OD600')
+        #orig.set_xlabel('elapsed time (minutes)')
+        orig.set_ylabel('OD600')
         orig.legend(loc='best')
 
         # log(OD) data with fit line
         logOD = fig.add_subplot(212)
         logOD.plot(self.elapsed_time, self.log_data, ls='', marker='.', label='ln(OD)')
         logOD.plot(self.elapsed_time, self.fit_y_values, 'r-', label='fit')
-        logOD.xlabel('elapsed time (minutes)')
-        logOD.ylabel('ln(OD600)')
+        logOD.set_xlabel('elapsed time (minutes)')
+        logOD.set_ylabel('ln(OD600)')
         logOD.legend(loc='best')
 
-        fig.savefig(self.name + '_plot.png', dpi=200, bbox_inches='tight')
+        self.plot_file = self.name + '_plot.png'
+        plot_path = os.path.join(self.out_dir, self.name)
+        fig.savefig(plot_path, dpi=200, bbox_inches='tight')
         fig.clf()
 
     # put functions of all actual data analysis and plotting here - create list of Sample objects in Experiment
+
 
 def main():
     parser = argparse.ArgumentParser(description = "Specify a data file to be analyzed.")
@@ -181,9 +193,31 @@ def main():
     method = args.method
     organism = args.organism
 
-    experiment = OD_growth_experiment(data_file, blank, method, out_dir, organism)
-    experiment.get_sample_data()
-    sample_output = experiment.analyze_sample_data()
+    print "got the inputs"
 
-    return pd.DataFrame(growth_rate_data, columns=['well', 'lag_time', 'max_growth_rate', 'time_of_max_rate', \
-                                                       'saturation_time', 'max_OD', 'time_of_max_OD', 'plot_file'])
+    experiment = OD_growth_experiment(data_file, blank, method, organism, out_dir)
+    print "created an experiment"
+
+    experiment.get_sample_data()
+    print "created samples"
+
+    sample_output = experiment.analyze_sample_data()
+    print "analyzed samples"
+
+    # write output to file!
+    output_name = os.path.basename(data_file) + '_output.txt'
+    new_file = os.path.join(out_dir, output_name)
+    output_file = open(new_file,'w')
+
+    output_file.write("well \t lag time \t max growth rate \t doubling time \t time of max rate \t saturation time " \
+                      "\t max OD \t time of max OD \n") #\t plot_file
+    for sample in sample_output:
+        doubling_time = np.log(2)/sample.maximum_rate
+        output_file.write("%s \t %i \t %f \t %f \t %i \t %i \t %f \t %i \n" % ( # \t %s
+            sample.name, sample.lag_time, sample.maximum_rate, doubling_time, sample.time_of_max_rate, sample.sat_time, \
+            sample.max_OD, sample.time_of_max_OD #, sample.plot_file
+        ))
+    print "wrote the output"
+
+if __name__ == "__main__":
+    main()
