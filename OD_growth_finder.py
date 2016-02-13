@@ -10,61 +10,75 @@ import matplotlib.pyplot as plt
 import datetime as datetime
 import os, argparse
 
+import seaborn as sns
+sns.set_context('poster', font_scale=1.25)
+sns.set_style('ticks')
+
 
 def reformat_time(x):
+
     """Assumes x is a datetime.time object."""
     time_in_seconds = (60.*60.*x.hour + 60*x.minute + x.second)
-    return time_in_seconds/(60.) # return time in minutes for computation of doubling time in minutes
+    return time_in_seconds/60.  # return time in minutes for computation of doubling time in minutes
 
 
 class OD_growth_experiment(object):
+    """Each experiment consists of one data file, one plate_layout file (optional), and some other arguments specific
+    to the experiment: blank well(s) or value, organism (determines window size for now), and output directory
+    """
 
-    def __init__(self, path_to_data, blank, method, organism, out_dir, s = 0.05):
+    def __init__(self, path_to_data, plate_layout=None, blank=0, organism='yeast', out_dir='./'):
         self.path_to_data = path_to_data
-        self.data = pd.read_excel(path_to_data) # not sure if read_csv might be better
-        # Drop the rows that have NAN's, usually at the end
-        self.data.dropna(inplace=True, axis=1)
+        self.data = pd.read_excel(path_to_data)
+        self.data.dropna(inplace=True, axis=1)  # Drop the rows that have NAN's, usually at the end
         self.sample_list = []
-        self.method = method
+
+        self.plate_layout = plate_layout
         self.organism = organism
         self.out_dir = out_dir
         self.name = os.path.splitext(os.path.basename(path_to_data))[0]
 
         # Get the times from the data - check for format and reformat if necessary
-        self.times = self.data.iloc[:,0].values # just assume first column is time data, returns numpy array
-        if self.times.dtype != 'int64': # if numeric, assumes minutes
+        self.times = self.data.iloc[:,0].values  # assume first column is time data, returns numpy array
+        if self.times.dtype not in ['int64', 'float64']:  # if numeric, assume minutes
             self.times = self.times.astype(datetime.time)
-            self.elapsed_time = self.times.apply(reformat_time)
+            self.elapsed_time = reformat_time(self.times)
         else: self.elapsed_time = self.times
+        self.data.drop(self.data.columns[[0]], inplace=True, axis=1)  # remove time column from data to be analyzed
 
-        self.data.drop(self.data.columns[[0]], inplace=True, axis=1) # remove time column from data to be analyzed
+        #if 'Temperature' in self.data.columns: # TODO: not finding temperature column...need fnmatch?
+        #    print "found temperature column"
+        #    self.data.drop['Temperature']  # remove Temperature column from data to be analyzed
 
         # check blank
-        if type(blank) == 'str':
-            self.blank = self.data.mean()[blank] # if blank input is well, blank is average value of that well
+        if type(blank) == 'str':  # TODO: accommodate input of multiple blank wells, average value at each time point
+            self.blank = self.data.mean()[blank]  # if blank input is well, blank is average value of that well
         else: self.blank = float(blank)
 
-        # Set the default s for fitting...deals with how close the fit is to the points
-        self.s = s
+    def create_sample_list(self):  # creates list of Sample objects
 
-    def get_sample_data(self):
         for well_str in self.data.columns: # well_str is name of column
-            # create Sample object Sample(experiment, data) and add to sample list
             raw_data = self.data.loc[:, well_str].values # returns numpy array
             self.sample_list.append(Sample(self, well_str, raw_data))
+
         return self.sample_list
 
-    def analyze_sample_data(self):
+    def analyze_sample_data(self, method='smooth_n_slide', sample_plots=False, s=0.05):
 
         for sample in self.sample_list:
-            if self.method == 'spline':
-                sample.spline_max_growth_rate()
-            elif self.method == "sliding_window":
-                sample.sliding_window(sample.log_data)
-            elif self.method == "smooth_n_slide":
-                sample.smooth_n_slide()
-            # create list for each sample with results from any of the above methods
-            sample.plot_growth_parameters()
+            if method == 'smooth_n_slide':
+                sample.smooth_n_slide(s)
+            elif method == 'spline':
+                sample.spline_max_growth_rate(s)
+            elif method == 'sliding_window':
+                sample.sliding_window()
+
+            if sample_plots:
+                folder_name = self.name + '_plots'
+                plot_folder = os.path.join(self.out_dir, folder_name)
+                if not os.path.exists(plot_folder): os.makedirs(plot_folder)
+                sample.plot_growth_parameters(show=False, save=True, folder=plot_folder) # creates one plot per sample
+                # default show/save assumes that saving files is desired if function is called for an entire experiment
 
         return self.sample_list
 
@@ -81,9 +95,10 @@ class OD_growth_experiment(object):
             print "I don't know what organism you are using. Here's some data anyway."
         return window_size, interval
 
-    def create_dataframe(self):
-        expt_df = pd.DataFrame(
-            [   [sample.name,
+    def output_data(self, save=False):
+
+        self.expt_df = pd.DataFrame(
+            [[  sample.name,
                 sample.lag_time,
                 sample.growth_rate,
                 sample.doubling_time,
@@ -92,26 +107,45 @@ class OD_growth_experiment(object):
                 sample.max_OD,
                 sample.time_of_max_OD]
             for sample in self.sample_list],
-            columns = ("well", "lag time", "growth rate", "doubling time", "time of max growth rate",
-                        "saturation time", "max OD", "time of max OD"))
-        return expt_df
+            columns=("well", "lag time", "growth rate", "doubling time", "time of max growth rate",
+                     "saturation time", "max OD", "time of max OD"))
+        # TODO: add info from plate_layout file if not None
 
-    def plot_histogram(self, expt_df):
+        if save:
+            output_name = self.name + '_output.xlsx'
+            output_file = os.path.join(self.out_dir, output_name)
+            self.expt_df.to_excel(output_file)
+
+        return self.expt_df
+
+    def plot_histogram(self, save=False):
         # plot histogram of growth rates for entire experiment
-        plt.hist(expt_df["doubling time"])
-        plt.xlabel("number of samples")
-        plt.ylabel("doubling time")
-        plt.savefig(self.name + '_histogram.png', dpi=300, bbox_inches='tight')
+        sns.distplot(self.expt_df['doubling time'], rug=True)
+        plt.xlabel('number of samples')
+        plt.ylabel('doubling time')
 
-    def plot_heat_map(self, expt_df):
-        # check if sample names are well IDs:
-        if expt_df["well"][0] == "A01":
-        expt_array = expt_df["growth rates"]
+        if save: plt.savefig(self.name + '_histogram.png', dpi=300, bbox_inches='tight')
+
+    def plot_heatmap(self, save=False):
+        # only works if sample names are well IDs TODO: check if expt_df["well"][0] == "A01":
+        growth_data = self.expt_df['growth rate']
+        growth_data['row'] = growth_data['well'].apply(lambda x: ord(x[0]) - 65)  # assign row by first letter of well
+        growth_data['column'] = growth_data['well'].apply(lambda x: int(x[1:]))  # assign column by remaining numbers
+
+        growth_rate_image = np.zeros((growth_data['row'].max() + 1, growth_data['column'].max() + 1))
+        growth_rate_image[growth_data['row'], growth_data['column']] = growth_data['growth rate']
+        min_rate = np.min(growth_data['growth rate'])
+        max_rate = np.max(growth_data['growth rate'])
+
+        plt.imshow(growth_rate_image, origin='upper', interpolation='None')
+        plt.colorbar()
+        plt.clim(min_rate - 0.05, max_rate)
         # plot heat map of growth rates for entire experiment
-        plt.pcolor(expt_array)
+        # plt.pcolor(expt_array)
+        if save: plt.savefig(self.name + '_heatmap.png', dpi=300, bbox_inches='tight')
 
-# create Sample class for attributes collected for each column of data
-class Sample(object):
+
+class Sample(object):  # create Sample class for attributes collected for each column of data
 
     def __init__(self, experiment, name, data):
         self.experiment = experiment # now ref attributes as self.experiment.attr
@@ -119,8 +153,9 @@ class Sample(object):
         self.out_dir = self.experiment.out_dir
         self.name = name
         self.raw_data = data
-        self.cal_data = self.raw_data - self.experiment.blank # subtract blank value, shouldn't be necessary...
+        self.cal_data = self.raw_data - self.experiment.blank # subtract blank value, either single value or vector
         self.log_data = np.log(self.cal_data) # Log of the calibrated OD
+        # TODO: measure OD values of serial dilution, remove or underweight very low and very high values if not linear
 
         # get max OD and time of max_OD
         self.max_OD_index = np.argmax(self.raw_data)
@@ -130,9 +165,9 @@ class Sample(object):
         # get min OD for lag time calculation
         self.min_logOD = np.amin(self.log_data)
 
-    def spline_max_growth_rate(self):
+    def spline_max_growth_rate(self, s):
 
-        interpolator = interpolate.UnivariateSpline(self.elapsed_time, self.log_data, k=4, s=0.05) #k can be 3-5
+        interpolator = interpolate.UnivariateSpline(self.elapsed_time, self.log_data, k=4, s=s) #k can be 3-5
         der = interpolator.derivative()
 
         # Get the approximation of the derivative at all points
@@ -143,30 +178,26 @@ class Sample(object):
         self.growth_rate = der_approx[self.maximum_index]
         self.doubling_time = np.log(2)/self.growth_rate
         self.time_of_max_rate = self.elapsed_time[self.maximum_index]
-        print self.name, self.growth_rate, self.time_of_max_rate
 
         # Get estimates of lag time and saturation time from 2nd derivative
         der2 = der.derivative()
         der2_approx = der2(self.elapsed_time)
-        try: self.lag_index = signal.argrelmax(der2_approx)[0][0] # find first max
+        try: self.lag_index = signal.argrelmax(der2_approx)[0][0]  # find first max
         except: self.lag_index = 0
         if self.lag_index > self.maximum_index: self.lag_index = 0
         self.lag_time = self.elapsed_time[self.lag_index]
-        minima = signal.argrelmin(der2_approx)[0] # find first min after maximum_index
-        which_min = bisect.bisect(minima,self.maximum_index)
+        minima = signal.argrelmin(der2_approx)[0]  # find first min after maximum_index
+        which_min = bisect.bisect(minima, self.maximum_index)
         try: self.sat_index = minima[which_min]
-        except: self.sat_index = -1
+        except: self.sat_index = len(self.elapsed_time) - 1
         self.sat_time = self.elapsed_time[self.sat_index]
 
         self.fit_y_values = interpolator(self.elapsed_time)
-        # we have a slope (self.growth_rate) and a point on the line (self.time_of_max_rate, self.log_data[self.maximum_index])
-        # we can draw a line representing the fit derivative:
-        self.intercept = self.log_data[self.maximum_index] - (self.growth_rate*self.time_of_max_rate) # b = y - mx
-        self.fit_on_orig = [(np.exp(self.growth_rate * x) * np.exp(self.intercept) + self.experiment.blank) \
-                            for x in self.elapsed_time]
+        self.intercept = self.log_data[self.maximum_index] - (self.growth_rate*self.time_of_max_rate) # b = y - ax
 
-    def sliding_window(self, data_to_use):
+    def sliding_window(self, data_to_use=None):
 
+        if data_to_use is None: data_to_use = self.log_data
         window_size, interval = self.experiment.get_window_size()
 
         rates = []
@@ -175,19 +206,18 @@ class Sample(object):
         num_windows = len(data_to_use)-window_size+1
         for i in range(0, num_windows):
             window_times = self.elapsed_time[i:i+window_size]
-            sub_data = data_to_use[i:i+window_size] # now use this sub_data to fit a line (not exp since we have the log2 data)
-            results = stats.linregress(window_times, sub_data) # get fit parameters
-            # save parameters
-            rates.append(results[0]) #first two items in results are slope and intercept
+            sub_data = data_to_use[i:i+window_size]
+            results = stats.linregress(window_times, sub_data)  # get fit parameters - this takes a while...
+            rates.append(results[0])
             intercepts.append(results[1])
             r_values.append(results[2])
 
-        maximum_rate = max(rates) # get max rate
-
-        # extension: find other slopes at 95% of max rate, use all points to calculate new rate
+        maximum_rate = max(rates)
+        # find other slopes at 95% of max rate, use all points to calculate new rate
         max95_rates = [rates.index(i) for i in rates if i >= 0.95*maximum_rate]
         start_point = max95_rates[0]
         end_point = max95_rates[-1] + window_size
+        # num_points = len(max95_rates) TODO: include start, end, and number of points in output
 
         window_times = self.elapsed_time[start_point:end_point]
         sub_data = data_to_use[start_point:end_point]
@@ -196,13 +226,11 @@ class Sample(object):
         self.intercept = results[1]
         self.r_squared = results[2]**2
 
-        self.maximum_index = int((end_point - start_point)/2) # returns midpoint of time window used to calc rate
+        self.maximum_index = int((end_point + start_point)/2) # returns midpoint of time window used to calc rate
         self.time_of_max_rate = self.elapsed_time[self.maximum_index]
         self.doubling_time = np.log(2)/self.growth_rate
 
-        # get lag_time and saturation_time parameters - how? from slope-intercept of max slope
-        print 'fit line is y = ' + str(self.growth_rate) + '*x + ' + str(self.intercept)
-        print 'r-squared is ' + str(self.r_squared)
+        # get lag_time and saturation_time parameters from slope-intercept of max slope
         self.lag_time = (np.amin(data_to_use) - self.intercept) / self.growth_rate # find x where y = min logOD
         self.lag_index = int(self.lag_time/interval)
         if self.lag_index > self.maximum_index: self.lag_index = 0
@@ -210,23 +238,21 @@ class Sample(object):
         self.sat_index = int(self.sat_time/interval)
         if self.sat_index > len(self.elapsed_time): self.sat_index = len(self.elapsed_time) - 1
         self.fit_y_values = [((self.growth_rate * x) + self.intercept) for x in self.elapsed_time]
-        self.fit_on_orig = [(np.exp(self.growth_rate * x) * np.exp(self.intercept) + self.experiment.blank) \
-                            for x in self.elapsed_time]
 
-    def smooth_n_slide(self):
+    def smooth_n_slide(self, s):
 
         # first get a spline:
-        interpolator = interpolate.UnivariateSpline(self.elapsed_time, self.log_data, k=4, s=0.05) #k can be 3-5
+        interpolator = interpolate.UnivariateSpline(self.elapsed_time, self.log_data, k=4, s=s) #k can be 3-5
         self.smooth_log_data = interpolator(self.elapsed_time)
 
-        # Get the approximation of the derivative at all points
-        der = interpolator.derivative()
-        der_approx = der(self.elapsed_time)
-
         # now compute rate from sliding window using smoothed data points
-        self.sliding_window(self.smooth_log_data)
+        self.sliding_window(data_to_use=self.smooth_log_data)
 
-    def plot_growth_parameters(self):
+    def plot_growth_parameters(self, show=True, save=False, folder='./'):
+        """Default show/save assumes that showing plot is desired if function is called for one sample
+        """
+        fit_on_orig = [(np.exp(self.growth_rate * x) * np.exp(self.intercept) + self.experiment.blank) \
+                            for x in self.elapsed_time]  # TODO: enable a vector of values for blank
 
         fig = plt.figure()
         # orig data with points marked for max growth, lag time, saturation time, and max OD
@@ -236,12 +262,10 @@ class Sample(object):
         orig.plot(self.elapsed_time[self.lag_index], self.raw_data[self.lag_index], 'bo', label='lag time')
         orig.plot(self.elapsed_time[self.sat_index], self.raw_data[self.sat_index], 'go', label='saturation time')
         orig.plot(self.time_of_max_OD, self.raw_data[self.max_OD_index], 'ko', label='max OD')
-        #if self.experiment.method == 'sliding_window':
-        orig.plot(self.elapsed_time, self.fit_on_orig, 'r-', label='fit')
+        orig.plot(self.elapsed_time, fit_on_orig, 'r-', label='fit')
 
-        #orig.set_xlabel('elapsed time (minutes)')
         orig.set_ylabel('OD600')
-        orig.set_ylim(0,self.max_OD + 0.1)
+        orig.set_ylim(0,self.max_OD + 0.05)
         orig.legend(loc='best')
 
         # log(OD) data with fit line
@@ -253,22 +277,43 @@ class Sample(object):
         logOD.set_ylabel('ln(OD600)')
         logOD.legend(loc='best')
 
-        self.plot_file = self.name + '_plot.png'
-        plot_path = os.path.join(self.out_dir, self.name)
-        fig.savefig(plot_path, dpi=200, bbox_inches='tight')
-        fig.clf()
+        if show: plt.show(fig)  # TODO: check if this works - don't want plots shown unless show=True
 
-    # put functions of all actual data analysis and plotting here - create list of Sample objects in Experiment
+        if save:
+            self.plot_file = self.name + '_plot.png'
+            plot_path = os.path.join(folder, self.name)
+            fig.savefig(plot_path, dpi=200, bbox_inches='tight')
+            fig.clf()
 
 
-def main():
-    parser = argparse.ArgumentParser(description = "Specify a data file to be analyzed.")
+def analyze_experiment(
+        data_file, plate_layout=None, blank=0, method='smooth_n_slide', organism='yeast',
+        sample_plots=False, out_dir='./', s=0.05):
+    experiment = OD_growth_experiment(data_file, plate_layout, blank, organism, out_dir)
+    print "created experiment"
+    experiment.create_sample_list()
+    print "input samples"
+    experiment.analyze_sample_data(method, sample_plots, s)  # these arguments only apply to analysis
+    print "analyzed samples"
+    experiment.output_data(save=True)
+    print "created output data file"
+    return experiment
+
+
+def make_plots(experiment, save=False):
+    experiment.plot_histogram(save)
+    experiment.plot_heatmap(save)
+
+
+def main():  # Defaults include making all plots and saving all files
+    parser = argparse.ArgumentParser(description='Specify a data file to be analyzed.')
     parser.add_argument('-f', '--data_file', required=True, help='Full path to data file.')
-    parser.add_argument('-p', '--plate_layout_file', help='Full path to file with plate layout information.')
+    parser.add_argument('-p', '--plate_layout_file', default=None, help='Full path to file with plate layout information.')
     parser.add_argument('-b', '--blank', default=0, help='Either a blank value or well to calculate blank value.')
-    parser.add_argument('-m', '--method', default='spline', help='Choose method used for data analysis.')
-    parser.add_argument('-o', '--output_directory', help='Full path to output directory.')
-    parser.add_argument('--organism', default='yeast', help='Organism in experiment [yeast, bacteria]; used in sliding_window method')
+    parser.add_argument('-m', '--method', default='smooth_n_slide', help='Choose method used for data analysis.')
+    parser.add_argument('-o', '--output_directory', default='./', help='Full path to output directory.')
+    parser.add_argument('--organism', default='yeast', help='Organism in experiment [yeast, bacteria]; '
+                                                            'used in sliding window methods')
     args = parser.parse_args()
 
     data_file = args.data_file
@@ -278,38 +323,23 @@ def main():
     method = args.method
     organism = args.organism
 
-    print "got the inputs"
-
-    experiment = OD_growth_experiment(data_file, blank, method, organism, out_dir)
+    experiment = OD_growth_experiment(data_file, plate_layout, blank, organism, out_dir)
     print "created an experiment"
 
-    experiment.get_sample_data()
-    print "created samples"
+    experiment.create_sample_list()
+    print "input samples"
 
-    sample_output = experiment.analyze_sample_data()
+    experiment.analyze_sample_data(method=method, sample_plots=True)
     print "analyzed samples"
 
-    # create pandas dataframe of sample info:
-    expt_df = experiment.create_dataframe()
+    # create pandas dataframe of sample info and write to output
+    expt_df = experiment.output_data(save=True)
+    print "created output data file"
 
     # plots!
-    experiment.plot_histogram(expt_df)
-    experiment.plot_heat_map(expt_df)
+    experiment.plot_histogram(expt_df, save=True)
+    experiment.plot_heatmap(expt_df, save=True)
 
-    # write output to file!
-    output_name = os.path.basename(data_file) + '_output.txt'
-    new_file = os.path.join(out_dir, output_name)
-    output_file = open(new_file,'w')
-
-    output_file.write("well \t lag time \t max growth rate \t doubling time \t time of max rate \t saturation time " \
-                      "\t max OD \t time of max OD \n") #\t plot_file
-    for sample in sample_output:
-
-        output_file.write("%s \t %i \t %f \t %f \t %i \t %i \t %f \t %i \n" % ( # \t %s
-            sample.name, sample.lag_time, sample.growth_rate, doubling_time, sample.time_of_max_rate, sample.sat_time, \
-            sample.max_OD, sample.time_of_max_OD #, sample.plot_file
-        ))
-    print "wrote the output"
 
 if __name__ == "__main__":
     main()
