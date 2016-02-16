@@ -8,7 +8,7 @@ from scipy import interpolate, signal, stats
 import bisect
 import matplotlib.pyplot as plt
 import datetime as datetime
-import os, argparse
+import os, argparse, sys
 
 import seaborn as sns
 sns.set_context('poster', font_scale=1.25)
@@ -32,8 +32,8 @@ class OD_growth_experiment(object):
         self.data = pd.read_excel(path_to_data)
         self.data.dropna(inplace=True, axis=1)  # Drop the rows that have NAN's, usually at the end
         self.sample_list = []
-
         self.plate_layout = plate_layout
+
         self.organism = organism
         self.out_dir = out_dir
         self.name = os.path.splitext(os.path.basename(path_to_data))[0]
@@ -97,7 +97,7 @@ class OD_growth_experiment(object):
 
     def output_data(self, save=False):
 
-        self.expt_df = pd.DataFrame(
+        self.results = pd.DataFrame(
             [[  sample.name,
                 sample.lag_time,
                 sample.growth_rate,
@@ -109,40 +109,61 @@ class OD_growth_experiment(object):
             for sample in self.sample_list],
             columns=("well", "lag time", "growth rate", "doubling time", "time of max growth rate",
                      "saturation time", "max OD", "time of max OD"))
-        # TODO: add info from plate_layout file if not None
+
+        if self.plate_layout is not None:
+            plate_info = pd.read_excel(self.plate_layout)
+            self.results = pd.merge(self.results, plate_info, how='outer', on='well')
 
         if save:
             output_name = self.name + '_output.xlsx'
             output_file = os.path.join(self.out_dir, output_name)
-            self.expt_df.to_excel(output_file)
+            self.results.to_excel(output_file)
 
-        return self.expt_df
+        return self.results
 
-    def plot_histogram(self, save=False):
+    def plot_histogram(self, show=True, save=False, metric='doubling time', unit='minutes'):
         # plot histogram of growth rates for entire experiment
-        sns.distplot(self.expt_df['doubling time'], rug=True)
-        plt.xlabel('number of samples')
-        plt.ylabel('doubling time')
+        sns.distplot(self.results[metric], kde=False, rug=True)
+        plt.xlabel(metric + ' (' + unit +')')
+        plt.ylabel('number of samples')
 
-        if save: plt.savefig(self.name + '_histogram.png', dpi=300, bbox_inches='tight')
+        if save:
+            hist_name = self.name +'_'+ metric.replace(' ', '_') +'_histogram.png'
+            hist_file = os.path.join(self.out_dir, hist_name)
+            plt.savefig(hist_file, dpi=300, bbox_inches='tight')
 
-    def plot_heatmap(self, save=False):
-        # only works if sample names are well IDs TODO: check if expt_df["well"][0] == "A01":
-        growth_data = self.expt_df['growth rate']
-        growth_data['row'] = growth_data['well'].apply(lambda x: ord(x[0]) - 65)  # assign row by first letter of well
-        growth_data['column'] = growth_data['well'].apply(lambda x: int(x[1:]))  # assign column by remaining numbers
+        if show:
+            return plt.show()
 
-        growth_rate_image = np.zeros((growth_data['row'].max() + 1, growth_data['column'].max() + 1))
-        growth_rate_image[growth_data['row'], growth_data['column']] = growth_data['growth rate']
-        min_rate = np.min(growth_data['growth rate'])
-        max_rate = np.max(growth_data['growth rate'])
+    def plot_heatmap(self, show=True, save=False, metric='growth rate'):
+        # only works if sample names are well IDs
+        self.results['row'] = self.results['well'].apply(lambda x: ord(x[0]) - 65)
+        self.results['column'] = self.results['well'].apply(lambda x: int(x[1:]) - 1)
 
-        plt.imshow(growth_rate_image, origin='upper', interpolation='None')
-        plt.colorbar()
-        plt.clim(min_rate - 0.05, max_rate)
-        # plot heat map of growth rates for entire experiment
-        # plt.pcolor(expt_array)
-        if save: plt.savefig(self.name + '_heatmap.png', dpi=300, bbox_inches='tight')
+        if self.results['row'].max() > 7 or self.results['column'].max() > 11:
+            results_arr = np.empty((16, 24))  # assume 384-well plate
+            results_arr.fill(np.nan)
+        else:
+            results_arr = np.empty((8, 12))  # assume 96-well plate
+            results_arr.fill(np.nan)
+
+        results_arr[self.results['row'], self.results['column']] = self.results[metric]
+
+        # only show if not saved?
+        data = pd.DataFrame(results_arr, index=['A','B','C','D','E','F','G','H'], columns=range(1,13))
+        sns.set_style('darkgrid')
+        fig = sns.heatmap(data, cmap='spring_r', linewidths=0.01)
+        plt.yticks(rotation=0)
+        fig.xaxis.set_ticks_position('top')
+        plt.title(metric, y=1.1)
+
+        if save:
+            heat_name = self.name +'_'+ metric.replace(' ', '_') +'_heatmap.png'
+            heat_file = os.path.join(self.out_dir, heat_name)
+            plt.savefig(heat_file, dpi=300, bbox_inches='tight')
+
+        if show:
+            return plt.show()
 
 
 class Sample(object):  # create Sample class for attributes collected for each column of data
@@ -281,7 +302,7 @@ class Sample(object):  # create Sample class for attributes collected for each c
 
         if save:
             self.plot_file = self.name + '_plot.png'
-            plot_path = os.path.join(folder, self.name)
+            plot_path = os.path.join(folder, self.plot_file)
             fig.savefig(plot_path, dpi=200, bbox_inches='tight')
             fig.clf()
 
@@ -300,9 +321,31 @@ def analyze_experiment(
     return experiment
 
 
-def make_plots(experiment, save=False):
-    experiment.plot_histogram(save)
-    experiment.plot_heatmap(save)
+def make_plots(experiment, show=True, save=False, metric1='doubling time', unit='minutes', metric2='growth rate'):
+    experiment.plot_histogram(show, save, metric1, unit)
+    experiment.plot_heatmap(show, save, metric2)
+
+
+def compute_means(experiment, metric=['growth rate'], save=False, keys=None):
+    data = experiment.results
+    if keys is None:
+        print 'Please indicate one or more ways to group samples with key list.'
+        sys.exit(1)
+
+    means={}
+    for m in metric:
+        data_mean = data[m].groupby([data[x] for x in keys]).mean()
+        means[m] = data_mean
+
+    data_means = pd.DataFrame(means)
+
+    if save:
+        if len(metric) > 1: output_name = experiment.name + '_means.csv'
+        else: output_name = experiment.name +'_'+ metric.replace(' ', '_') +'_means.csv'
+        output_file = os.path.join(experiment.out_dir, output_name)
+        data_means.to_excel(output_file)  # can I save list of
+
+    return data_means
 
 
 def main():  # Defaults include making all plots and saving all files
@@ -333,12 +376,13 @@ def main():  # Defaults include making all plots and saving all files
     print "analyzed samples"
 
     # create pandas dataframe of sample info and write to output
-    expt_df = experiment.output_data(save=True)
+    results = experiment.output_data(save=True)
     print "created output data file"
 
     # plots!
-    experiment.plot_histogram(expt_df, save=True)
-    experiment.plot_heatmap(expt_df, save=True)
+    experiment.plot_histogram(results, save=True)
+    experiment.plot_heatmap(results, save=True)
+    print "saved plots for experiment data"
 
 
 if __name__ == "__main__":
