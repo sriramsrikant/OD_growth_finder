@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# OD_growth_finder.py
+# growth_curve_analysis.py
+
+# adapted from OD_growth_finder.py created by Bryan Weinstein
+# renamed to reflect additional calculation methods and distinguish from original program
 
 import pandas as pd
 import numpy as np
