@@ -127,7 +127,7 @@ class OD_growth_experiment(object):
             output_name = os.path.join(self.out_dir, (self.name + '_output.xlsx'))
             output_file = pd.ExcelWriter(output_name, engine='xlsxwriter', datetime_format='mmm d yyyy')
             self.results.to_excel(output_file)
-            output_file.save()
+            output_file.close()
 
         return self.results
 
@@ -161,7 +161,10 @@ class OD_growth_experiment(object):
         # only show if not saved?
         data = pd.DataFrame(results_arr, index=['A','B','C','D','E','F','G','H'], columns=range(1,13))
         sns.set_style('darkgrid')
-        fig = sns.heatmap(data, cmap='spring_r', linewidths=0.01)
+        if self.organism is 'yeast': max = 0.015  # about 60 minutes doubling time
+        elif self.organism is 'bacteria': max = 0.05  # about 15 minutes doubling time
+        else: max = None  # infer from data
+        fig = sns.heatmap(data, vmin = 0, vmax = max, cmap='spring_r', linewidths=0.01)
         plt.yticks(rotation=0)
         fig.xaxis.set_ticks_position('top')
         if unit: plt.title(metric + ' (' + unit +')', y=1.1)
@@ -193,12 +196,11 @@ class Sample(object):  # create Sample class for attributes collected for each c
         self.max_OD = self.raw_data[self.max_OD_index]
         self.time_of_max_OD = self.elapsed_time[self.max_OD_index]
 
-        # get min OD for lag time calculation - no longer used
-        self.min_logOD = np.amin(self.log_data)
+        self.spline = None
 
     def spline_max_growth_rate(self, s):
 
-        interpolator = interpolate.UnivariateSpline(self.elapsed_time, self.log_data, k=4, s=s) #k can be 3-5
+        interpolator = interpolate.UnivariateSpline(self.elapsed_time, self.log_data, k=4, s=s)  #k can be 3-5
         der = interpolator.derivative()
 
         # Get the approximation of the derivative at all points
@@ -217,11 +219,13 @@ class Sample(object):  # create Sample class for attributes collected for each c
         except: self.lag_index = 0
         if self.lag_index > self.maximum_index: self.lag_index = 0
         self.lag_time = self.elapsed_time[self.lag_index]
+        self.lag_OD = self.raw_data[self.lag_index]
         minima = signal.argrelmin(der2_approx)[0]  # find first min after maximum_index
         which_min = bisect.bisect(minima, self.maximum_index)
         try: self.sat_index = minima[which_min]
         except: self.sat_index = len(self.elapsed_time) - 1
         self.sat_time = self.elapsed_time[self.sat_index]
+        self.sat_OD = self.raw_data[self.sat_index]
 
         self.spline = interpolator(self.elapsed_time)
         self.intercept = self.log_data[self.maximum_index] - (self.growth_rate*self.time_of_max_rate) # b = y - ax
@@ -244,6 +248,7 @@ class Sample(object):  # create Sample class for attributes collected for each c
         return rates, intercepts, window_size
 
     def get_max_growth_parameters(self, data=None):  # run sliding window for max growth rate
+
         if data is None: data = self.log_data
         rates, intercepts, window_size = self.sliding_window(data=data)
         maximum_rate = max(rates)
@@ -252,9 +257,6 @@ class Sample(object):  # create Sample class for attributes collected for each c
             self.growth_rate, self.intercept, self.maximum_index, self.time_of_max_rate, self.doubling_time, \
             self.fit_y_values = None, None, None, None, None, None
         else:
-            #if maximum_rate <= 0.:
-            #    max95_rates = [rates.index(i) for i in rates if i >= 1.05*maximum_rate]
-            #else:
             max95_rates = [rates.index(i) for i in rates if i >= 0.95*maximum_rate]
             start_point = max95_rates[0]
             end_point = max95_rates[-1] + window_size - 1
@@ -276,16 +278,23 @@ class Sample(object):  # create Sample class for attributes collected for each c
                 self.fit_y_values = [((self.growth_rate * x) + self.intercept) for x in self.elapsed_time]  # for plotting
 
     def get_lag_sat_parameters(self):  # run sliding window for raw data rates
-        rates, intercepts, window_size = self.sliding_window(data=self.raw_data)
-        first_rate = rates[0]
-        if self.growth_rate > 0 and first_rate < self.growth_rate/4:
-            self.lag_index = self.get_flex_point(rates, 'lag', window_size)
-            if self.lag_index < self.maximum_index and self.lag_index is not None:
-                self.lag_time = self.elapsed_time[self.lag_index]
-                self.lag_OD = self.raw_data[self.lag_index]
-            else: self.lag_index, self.lag_time, self.lag_OD = None, None, None
+
+        log_data = list(self.log_data)
+        first_logOD = log_data[0]
+        # find points within 0.2 on logOD scale:
+        low_OD_points = [log_data.index(p) for p in log_data if first_logOD-0.2 <= p <= first_logOD+0.2]
+        low_times = [self.elapsed_time[t] for t in low_OD_points]
+        low_ODs = [log_data[p] for p in low_OD_points]
+        lag_line = stats.linregress(low_times, low_ODs)
+        if lag_line[0] < self.growth_rate/4:
+            self.lag_time = (lag_line[1] - self.intercept)/(self.growth_rate - lag_line[0])
+            #self.lag_OD = self.growth_rate*self.lag_time + self.intercept
+            interval = self.elapsed_time[1] - self.elapsed_time[0]
+            self.lag_index = int(self.lag_time/interval)
+            self.lag_OD = self.raw_data[self.lag_index]
         else: self.lag_index, self.lag_time, self.lag_OD = None, None, None
 
+        rates, intercepts, window_size = self.sliding_window(data=self.raw_data)
         last_rate = rates[-1]
         if self.growth_rate > 0 and last_rate < self.growth_rate/4:
             self.sat_index = self.get_flex_point(rates, 'saturation', window_size)
@@ -343,6 +352,8 @@ class Sample(object):  # create Sample class for attributes collected for each c
         logOD = fig.add_subplot(212)
         logOD.plot(self.elapsed_time, self.log_data, ls='', marker='.', label='ln(OD)')
         logOD.autoscale(False)  # don't want plot rescaled for fit line
+        if self.spline is not None:
+            logOD.plot(self.elapsed_time, self.spline, 'k-', label='spline')
         if self.growth_rate is not None:
             logOD.plot(self.elapsed_time, self.fit_y_values, 'r-', label='fit')
         logOD.set_xlabel('elapsed time (minutes)')
@@ -361,7 +372,7 @@ class Sample(object):  # create Sample class for attributes collected for each c
 
 def analyze_experiment(
         data_file, plate_layout=None, blank=0, method='smooth_n_slide', organism='yeast',
-        sample_plots=False, out_dir='./', s=0.05):
+        sample_plots=False, out_dir='./', s=0.1):
     experiment = OD_growth_experiment(data_file, plate_layout, blank, organism, out_dir)
     print "created experiment"
     experiment.create_sample_list()
@@ -378,26 +389,22 @@ def make_plots(experiment, show=True, save=False, metric1='doubling time', unit=
     experiment.plot_heatmap(show, save, metric2)
 
 
-def compute_means(experiment, metric=['growth rate'], save=False, keys=None):
+def compute_means(experiment, metric=['growth rate'], save=False, keys=None):  # TODO: add other calculations
     data = experiment.results
     if keys is None:
         print 'Please indicate one or more ways to group samples with key list.'
         sys.exit(1)
 
-    means={}
-    for m in metric:
-        data_mean = data[m].groupby([data[x] for x in keys]).mean()
-        means[m] = data_mean
-
-    data_means = pd.DataFrame(means)
+    grouped_data = data[metric].groupby([data[x] for x in keys])
+    data_calc = grouped_data.agg([np.mean, np.std])
 
     if save:
         if len(metric) > 1: output_name = experiment.name + '_means.xlsx'
-        else: output_name = experiment.name +'_'+ metric.replace(' ', '_') +'_means.xlsx'
+        else: output_name = experiment.name +'_'+ metric[0].replace(' ', '_') +'_means.xlsx'
         output_file = os.path.join(experiment.out_dir, output_name)
-        data_means.to_excel(output_file)
+        data_calc.to_excel(output_file)
 
-    return data_means
+    return data_calc
 
 
 def main():  # Defaults include making all plots and saving all files
