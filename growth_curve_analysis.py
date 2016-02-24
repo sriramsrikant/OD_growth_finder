@@ -14,7 +14,7 @@ import os, argparse, sys
 
 import seaborn as sns
 sns.set_context('poster', font_scale=1.25)
-sns.set_style('ticks')
+sns.set_style('darkgrid')
 
 
 def reformat_time(x):
@@ -67,15 +67,15 @@ class OD_growth_experiment(object):
 
         return self.samples
 
-    def analyze_sample_data(self, method='smooth_n_slide', sample_plots=False, s=0.05):
+    def analyze_sample_data(self, method='smooth_n_slide', sample_plots=False, s=0.05, droplow=False):
 
         for sample in self.samples.itervalues():
             if method == 'smooth_n_slide':
-                sample.smooth_n_slide(s)
+                sample.smooth_n_slide(s, droplow=droplow)
             elif method == 'spline':
-                sample.spline_max_growth_rate(s)
+                sample.spline_max_growth_rate(s, droplow=droplow)
             elif method == 'sliding_window':
-                sample.get_max_growth_parameters()
+                sample.get_max_growth_parameters(droplow=droplow)
                 sample.get_lag_sat_parameters()
 
             if sample_plots:
@@ -163,11 +163,11 @@ class OD_growth_experiment(object):
 
         # only show if not saved?
         data = pd.DataFrame(results_arr, index=['A','B','C','D','E','F','G','H'], columns=range(1,13))
-        sns.set_style('darkgrid')
-        if self.organism is 'yeast': max = 0.015  # about 60 minutes doubling time
-        elif self.organism is 'bacteria': max = 0.05  # about 15 minutes doubling time
-        else: max = None  # infer from data
-        fig = sns.heatmap(data, vmin = 0, vmax = max, cmap='spring_r', linewidths=0.01)
+        #sns.set_style('darkgrid')
+        #if self.organism is 'yeast': max = 0.015  # about 60 minutes doubling time only valid for growth rate metric
+        #elif self.organism is 'bacteria': max = 0.05  # about 15 minutes doubling time
+        #else: max = None  # infer from data
+        fig = sns.heatmap(data, vmin = 0, cmap='spring_r', linewidths=0.01)
         plt.yticks(rotation=0)
         fig.xaxis.set_ticks_position('top')
         if unit: plt.title(metric + ' (' + unit +')', y=1.1)
@@ -201,9 +201,11 @@ class Sample(object):  # create Sample class for attributes collected for each c
 
         self.spline = None
 
-    def spline_max_growth_rate(self, s):
+    def spline_max_growth_rate(self, s, droplow=False):
 
-        interpolator = interpolate.UnivariateSpline(self.elapsed_time, self.log_data, k=4, s=s)  #k can be 3-5
+        if droplow: data = np.where(self.log_data < -2.3, 'nan', self.log_data)
+        else: data = self.log_data
+        interpolator = interpolate.UnivariateSpline(self.elapsed_time, data, k=4, s=s)  #k can be 3-5
         der = interpolator.derivative()
 
         # Get the approximation of the derivative at all points
@@ -245,16 +247,19 @@ class Sample(object):  # create Sample class for attributes collected for each c
         for i in range(0, num_windows):
             window_times = self.elapsed_time[i:i+window_size]
             sub_data = data[i:i+window_size]
-            results = stats.linregress(window_times, sub_data)  # get fit parameters - this takes a while...
+            results = stats.mstats.linregress(window_times, sub_data)  # get fit parameters - this takes a while...
             rates.append(results[0])
             intercepts.append(results[1])
         return rates, intercepts, window_size
 
-    def get_max_growth_parameters(self, data=None):  # run sliding window for max growth rate
+    def get_max_growth_parameters(self, data=None, droplow=False):  # run sliding window for max growth rate
 
         if data is None: data = self.log_data
+        if droplow:
+            masked_data = np.ma.masked_less(np.copy(data), -2.3)
+            data = masked_data
         rates, intercepts, window_size = self.sliding_window(data=data)
-        maximum_rate = max(rates)
+        maximum_rate = np.nanmax(rates)
         # find other slopes within 5% of max rate, use all points to calculate new rate
         if maximum_rate <= 0. or np.isnan(maximum_rate):
             self.growth_rate, self.intercept, self.maximum_index, self.time_of_max_rate, self.doubling_time, \
@@ -266,7 +271,7 @@ class Sample(object):  # create Sample class for attributes collected for each c
             # num_points = len(max95_rates) TODO: include start, end, and number of points in output
             window_times = self.elapsed_time[start_point:end_point]
             sub_data = data[start_point:end_point]
-            results = stats.linregress(window_times, sub_data)
+            results = stats.mstats.linregress(window_times, sub_data)
             new_rate = results[0]
             if new_rate <=0 or np.isnan(new_rate):
                 self.growth_rate, self.intercept, self.maximum_index, self.time_of_max_rate, self.doubling_time, \
@@ -289,7 +294,7 @@ class Sample(object):  # create Sample class for attributes collected for each c
         low_times = [self.elapsed_time[t] for t in low_OD_points]
         low_ODs = [log_data[p] for p in low_OD_points]
         lag_line = stats.linregress(low_times, low_ODs)
-        if lag_line[0] < self.growth_rate/4:
+        if self.growth_rate > 0 and lag_line[0] < self.growth_rate/4:
             self.lag_time = (lag_line[1] - self.intercept)/(self.growth_rate - lag_line[0])
             #self.lag_OD = self.growth_rate*self.lag_time + self.intercept
             interval = self.elapsed_time[1] - self.elapsed_time[0]
@@ -319,13 +324,16 @@ class Sample(object):  # create Sample class for attributes collected for each c
         else: flex_point = None
         return flex_point
 
-    def smooth_n_slide(self, s):
+    def smooth_n_slide(self, s, droplow):
+
+        if droplow: data = np.where(self.log_data < -2.3, 'nan', self.log_data)
+        else: data = self.log_data
         # first get a spline:
-        interpolator = interpolate.UnivariateSpline(self.elapsed_time, self.log_data, k=4, s=s) #k can be 3-5
+        interpolator = interpolate.UnivariateSpline(self.elapsed_time, data, k=4, s=s) #k can be 3-5
         self.smooth_log_data = interpolator(self.elapsed_time)
 
         # now compute rate from sliding window using smoothed data points
-        self.get_max_growth_parameters(data=self.smooth_log_data)
+        self.get_max_growth_parameters(self.smooth_log_data, droplow)
         self.get_lag_sat_parameters()
 
     def plot_growth_parameters(self, show=True, save=False, folder='./'):
@@ -375,12 +383,12 @@ class Sample(object):  # create Sample class for attributes collected for each c
 
 def analyze_experiment(
         data_file, plate_layout=None, blank=0, method='smooth_n_slide', organism='yeast',
-        sample_plots=False, out_dir='./', s=0.1):
+        sample_plots=False, out_dir='./', s=0.1, droplow=False):
     experiment = OD_growth_experiment(data_file, plate_layout, blank, organism, out_dir)
     print "created experiment"
     experiment.create_sample_list()
     print "input samples"
-    experiment.analyze_sample_data(method, sample_plots, s)  # these arguments only apply to analysis
+    experiment.analyze_sample_data(method, sample_plots, s, droplow)  # these arguments only apply to analysis
     print "analyzed samples"
     experiment.output_data(save=True)
     print "created output data file"
