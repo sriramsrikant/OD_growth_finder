@@ -10,7 +10,7 @@ import numpy as np
 from scipy import interpolate, signal, stats
 import bisect
 import matplotlib.pyplot as plt
-import os, argparse, sys
+import os, argparse, sys, datetime
 
 import seaborn as sns
 sns.set_context('poster', font_scale=1.25)
@@ -97,6 +97,8 @@ class OD_growth_experiment(object):
             window_size = int(30/interval)
         else:
             window_size = 5
+        if window_size > len(self.elapsed_time)/2:  # recalculate window size for small number of data points
+            window_size = int(len(self.elapsed_time)/2)
         return window_size, interval
 
     def output_data(self, save=False):
@@ -181,6 +183,40 @@ class OD_growth_experiment(object):
         if show:
             return plt.show()
 
+    def effective_growth_rate(self, start=0, end=None, save=False):  # calculate and make dataframe
+        # get start and end times, reformat if necessary
+        if end is None: end = self.elapsed_time[-1]
+        if type(start) not in [int, float]:  # if numeric, assume minutes
+            start = reformat_time(datetime.datetime.strptime(start, '%H:%M:%S').time()) #.astype(datetime.time)) #time.strptime(start, '%H:%M:%S'))
+        if type(end) not in [int, float]:  # if numeric, assume minutes
+            end = reformat_time(datetime.datetime.strptime(end, '%H:%M:%S').time()) #end.astype(datetime.time)) #time.strptime(end, '%H:%M:%S'))
+        time_change = end - start
+        # get indices of start and end times in self.elapsed_time list:
+        start_index = self.elapsed_time.index(start)
+        end_index = self.elapsed_time.index(end)
+        # now get ODs and calculate for each sample
+        effective_rates = {}
+        for sample in self.samples.itervalues():
+            start_logOD = sample.log_data[start_index]
+            end_logOD = sample.log_data[end_index]
+            logOD_change = end_logOD - start_logOD
+            effective_gr = logOD_change/time_change
+            doubling_time = np.log(2)/effective_gr
+            effective_rates[sample.name] = [effective_gr, doubling_time]
+
+        eff_data = pd.DataFrame.from_dict(effective_rates, orient='index')
+        eff_data.columns = ['effective growth rate', 'effective doubling time']
+        eff_data.sort_index(inplace=True)
+
+        if save:
+            start_to_end = str(start) + '-' + str(end)
+            output_name = os.path.join(self.out_dir, (self.name + '_eff_growth_' + start_to_end + '.xlsx'))
+            output_file = pd.ExcelWriter(output_name, engine='xlsxwriter')
+            eff_data.to_excel(output_file)
+            output_file.close()
+
+        return eff_data
+
 
 class Sample(object):  # create Sample class for attributes collected for each column of data
 
@@ -236,7 +272,7 @@ class Sample(object):  # create Sample class for attributes collected for each c
         self.intercept = self.log_data[self.maximum_index] - (self.growth_rate*self.time_of_max_rate) # b = y - ax
         self.fit_y_values = [((self.growth_rate * x) + self.intercept) for x in self.elapsed_time]  # for plotting
 
-    def sliding_window(self, data=None):
+    def sliding_window(self, data=None, masked=False):
 
         if data is None: data = self.log_data
         window_size, interval = self.experiment.get_window_size()
@@ -247,7 +283,10 @@ class Sample(object):  # create Sample class for attributes collected for each c
         for i in range(0, num_windows):
             window_times = self.elapsed_time[i:i+window_size]
             sub_data = data[i:i+window_size]
-            results = stats.mstats.linregress(window_times, sub_data)  # get fit parameters - this takes a while...
+            if masked and sub_data.count() < window_size:  # require more than two unmasked points for linear regression
+                results = [None, None]
+            else:
+                results = stats.mstats.linregress(window_times, sub_data)  # get fit parameters - this takes a while...
             rates.append(results[0])
             intercepts.append(results[1])
         return rates, intercepts, window_size
@@ -256,9 +295,10 @@ class Sample(object):  # create Sample class for attributes collected for each c
 
         if data is None: data = self.log_data
         if droplow:
+            masked = True
             masked_data = np.ma.masked_less(np.copy(data), -2.3)
-            data = masked_data
-        rates, intercepts, window_size = self.sliding_window(data=data)
+            data = masked_data  # require more than two points after masking?
+        rates, intercepts, window_size = self.sliding_window(data=data, masked=masked)
         maximum_rate = np.nanmax(rates)
         # find other slopes within 5% of max rate, use all points to calculate new rate
         if maximum_rate <= 0. or np.isnan(maximum_rate):
@@ -267,7 +307,8 @@ class Sample(object):  # create Sample class for attributes collected for each c
         else:
             max95_rates = [rates.index(i) for i in rates if i >= 0.95*maximum_rate]
             start_point = max95_rates[0]
-            end_point = max95_rates[-1] + window_size - 1
+            try: end_point = max95_rates[-1] + window_size
+            except: end_point = -1
             # num_points = len(max95_rates) TODO: include start, end, and number of points in output
             window_times = self.elapsed_time[start_point:end_point]
             sub_data = data[start_point:end_point]
@@ -290,11 +331,14 @@ class Sample(object):  # create Sample class for attributes collected for each c
         log_data = list(self.log_data)
         first_logOD = log_data[0]
         # find points within 0.2 on logOD scale:
-        low_OD_points = [log_data.index(p) for p in log_data if first_logOD-0.2 <= p <= first_logOD+0.2]
-        low_times = [self.elapsed_time[t] for t in low_OD_points]
-        low_ODs = [log_data[p] for p in low_OD_points]
+        low_ODs = []
+        low_times = []
+        for i, p in enumerate(log_data):
+            if first_logOD-0.05 <= p <= first_logOD+0.05:
+                low_ODs.append(p)
+                low_times.append(self.elapsed_time[i])
         lag_line = stats.linregress(low_times, low_ODs)
-        if self.growth_rate > 0 and lag_line[0] < self.growth_rate/4:
+        if self.growth_rate > 0 and lag_line[0] < self.growth_rate/2:
             self.lag_time = (lag_line[1] - self.intercept)/(self.growth_rate - lag_line[0])
             #self.lag_OD = self.growth_rate*self.lag_time + self.intercept
             interval = self.elapsed_time[1] - self.elapsed_time[0]
@@ -385,9 +429,9 @@ def analyze_experiment(
         data_file, plate_layout=None, blank=0, method='smooth_n_slide', organism='yeast',
         sample_plots=False, out_dir='./', s=0.1, droplow=False):
     experiment = OD_growth_experiment(data_file, plate_layout, blank, organism, out_dir)
-    print "created experiment"
+    print "initialized experiment"
     experiment.create_sample_list()
-    print "input samples"
+    print "created sample list"
     experiment.analyze_sample_data(method, sample_plots, s, droplow)  # these arguments only apply to analysis
     print "analyzed samples"
     experiment.output_data(save=True)
