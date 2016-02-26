@@ -295,10 +295,9 @@ class Sample(object):  # create Sample class for attributes collected for each c
 
         if data is None: data = self.log_data
         if droplow:
-            masked = True
             masked_data = np.ma.masked_less(np.copy(data), -2.3)
             data = masked_data  # require more than two points after masking?
-        rates, intercepts, window_size = self.sliding_window(data=data, masked=masked)
+        rates, intercepts, window_size = self.sliding_window(data=data, masked=droplow)
         maximum_rate = np.nanmax(rates)
         # find other slopes within 5% of max rate, use all points to calculate new rate
         if maximum_rate <= 0. or np.isnan(maximum_rate):
@@ -338,7 +337,7 @@ class Sample(object):  # create Sample class for attributes collected for each c
                 low_ODs.append(p)
                 low_times.append(self.elapsed_time[i])
         lag_line = stats.linregress(low_times, low_ODs)
-        if self.growth_rate > 0 and lag_line[0] < self.growth_rate/2:
+        if self.growth_rate > 0 and lag_line[0] < self.growth_rate/4:
             self.lag_time = (lag_line[1] - self.intercept)/(self.growth_rate - lag_line[0])
             #self.lag_OD = self.growth_rate*self.lag_time + self.intercept
             interval = self.elapsed_time[1] - self.elapsed_time[0]
