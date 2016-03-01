@@ -10,7 +10,7 @@ import numpy as np
 from scipy import interpolate, signal, stats
 import bisect
 import matplotlib.pyplot as plt
-import os, argparse, sys, datetime
+import os, argparse, sys, datetime, re
 
 import seaborn as sns
 sns.set_context('poster', font_scale=1.25)
@@ -35,6 +35,7 @@ class OD_growth_experiment(object):
         self.data.dropna(inplace=True, axis=1)  # Drop the rows that have NAN's, usually at the end
         self.samples = {}  # make this a dictionary instead
         self.plate_layout = plate_layout
+        self.results = None
 
         self.organism = organism
         self.out_dir = out_dir
@@ -47,9 +48,9 @@ class OD_growth_experiment(object):
         else: self.elapsed_time = self.times.tolist()
         self.data.drop(self.data.columns[[0]], inplace=True, axis=1)  # remove time column from data to be analyzed
 
-        #if 'Temperature' in self.data.columns: # TODO: not finding temperature column...need fnmatch?
-        #    print "found temperature column"
-        #    self.data.drop['Temperature']  # remove Temperature column from data to be analyzed
+        # remove Temperature column from data
+        temp = next(c for c in self.data.columns if re.match('Temp.*', c))
+        if temp: self.data.drop(temp, inplace=True, axis=1)
 
         # check blank TODO: accommodate input of multiple blank wells, average value at each time point
         if type(blank) is str:
@@ -57,7 +58,9 @@ class OD_growth_experiment(object):
         elif blank is None:
             self.blank = 0
         else:
-            self.blank = blank
+            self.blank = blank  # assumes input is a number
+
+        self.create_sample_list()
 
     def create_sample_list(self):  # creates dictionary of Sample objects
 
@@ -67,25 +70,41 @@ class OD_growth_experiment(object):
 
         return self.samples
 
-    def analyze_sample_data(self, method='smooth_n_slide', sample_plots=False, s=0.05, droplow=False):
+    def analyze_sample_data(self, method='sliding_window', sample_plots=False, s=0.05, droplow=False, start=0, end=None):
 
-        for sample in self.samples.itervalues():
-            if method == 'smooth_n_slide':
-                sample.smooth_n_slide(s, droplow=droplow)
-            elif method == 'spline':
-                sample.spline_max_growth_rate(s, droplow=droplow)
-            elif method == 'sliding_window':
+        # TODO: put common calculations before sample iterator, e.g. get_window_size()
+        self.method = method
+        if method == 'sliding_window':
+            for sample in self.samples.itervalues():
                 sample.get_max_growth_parameters(droplow=droplow)
                 sample.get_lag_sat_parameters()
+        elif method == 'smooth_n_slide':
+            for sample in self.samples.itervalues():
+                sample.smooth_n_slide(s, droplow=droplow)
+        elif method == 'spline':
+            for sample in self.samples.itervalues():
+                sample.spline_max_growth_rate(s, droplow=droplow)
+        elif method == 'effective_growth_rate':
+            if end is None:
+                end = self.elapsed_time[-1]
+            if type(start) not in [int, float]:  # if numeric, assume minutes
+                start = reformat_time(datetime.datetime.strptime(start, '%H:%M:%S').time())
+            if type(end) not in [int, float]:  # if numeric, assume minutes
+                end = reformat_time(datetime.datetime.strptime(end, '%H:%M:%S').time())
+            self.start = start
+            self.end = end
+            for sample in self.samples.itervalues():
+                sample.effective_growth_rate(start=start, end=end)
 
-            if sample_plots:
+        if sample_plots:
+            for sample in self.samples.itervalues():
                 folder_name = self.name + '_plots'
                 plot_folder = os.path.join(self.out_dir, folder_name)
                 if not os.path.exists(plot_folder): os.makedirs(plot_folder)
                 sample.plot_growth_parameters(show=False, save=True, folder=plot_folder) # creates one plot per sample
                 # default show/save assumes that saving files is desired if function is called for an entire experiment
 
-        return self.samples
+        return self
 
     def get_window_size(self):
         # determine a good window size - start with 1-1.5*(wt doubling time in minutes)/(time interval in minutes)
@@ -98,38 +117,66 @@ class OD_growth_experiment(object):
         else:
             window_size = 5
         if window_size > len(self.elapsed_time)/2:  # recalculate window size for small number of data points
-            window_size = int(len(self.elapsed_time)/2)
+            window_size = int(len(self.elapsed_time)/2)  # max window size possible is half the number of data points
         return window_size, interval
 
-    def output_data(self, save=False):
+    def output_data(self, method=None, save=False):
 
-        self.results = pd.DataFrame(
-            [[  sample.name,
-                sample.growth_rate,
-                sample.doubling_time,
-                sample.time_of_max_rate,
-                sample.lag_time,
-                sample.lag_OD,
-                sample.sat_time,
-                sample.sat_OD,
-                sample.max_OD,
-                sample.time_of_max_OD]
-            for sample in self.samples.itervalues()],
-            columns=("well", "growth rate", "doubling time", "time of max growth rate", "lag time", "OD at end of lag",
-                     "saturation time", "OD at saturation", "max OD", "time of max OD"))
+        method = self.method
+        if method in ['sliding_window', 'smooth_n_slide', 'spline']:
+            self.results = pd.DataFrame(
+                [[  sample.name,
+                    sample.growth_rate,
+                    sample.doubling_time,
+                    sample.time_of_max_rate,
+                    sample.lag_time,
+                    sample.lag_OD,
+                    sample.sat_time,
+                    sample.sat_OD,
+                    sample.max_OD,
+                    sample.time_of_max_OD]
+                for sample in self.samples.itervalues()],
+                columns=("well", "growth rate", "doubling time", "time of max growth rate", "lag time", "OD at end of lag",
+                         "saturation time", "OD at saturation", "max OD", "time of max OD"))
 
-        self.results['row'] = self.results['well'].apply(lambda x: ord(x[0]) - 64)
-        self.results['column'] = self.results['well'].apply(lambda x: int(x[1:]))
-        self.results.sort_values(['row','column'], inplace=True)
+            # only works if sample names are well IDs - add check?
+            self.results['row'] = self.results['well'].apply(lambda x: ord(x[0]) - 64)
+            self.results['column'] = self.results['well'].apply(lambda x: int(x[1:]))
+            self.results.sort_values(['row','column'], inplace=True)
 
-        if self.plate_layout is not None:
-            plate_info = pd.read_excel(self.plate_layout)
-            self.results = pd.merge(self.results, plate_info, how='outer', on='well')
+            if self.plate_layout is not None:
+                plate_info = pd.read_excel(self.plate_layout)
+                self.results = pd.merge(self.results, plate_info, how='inner', on='well', sort=False)
 
-        self.results.set_index(np.arange(1, len(self.results.index)+1), inplace=True)
+            self.results.set_index(np.arange(1, len(self.results.index)+1), inplace=True)
 
-        if save:
+        elif method == 'effective_growth_rate':
+
+            start_to_end = str(self.start) + '-' + str(self.end)
+            eff_data = pd.DataFrame(
+                [[sample.name, sample.effective_gr, sample.effective_dt]
+                 for sample in self.samples.itervalues()],
+                columns=('well', 'growth rate' + start_to_end, 'doubling time' + start_to_end))
+            if self.results:
+                self.results = pd.merge(self.results, eff_data, how='left', on='well', sort=False)
+            else:
+                self.results = eff_data
+                self.results['row'] = self.results['well'].apply(lambda x: ord(x[0]) - 64)
+                self.results['column'] = self.results['well'].apply(lambda x: int(x[1:]))
+                self.results.sort_values(['row','column'], inplace=True)
+                if self.plate_layout is not None:
+                    plate_info = pd.read_excel(self.plate_layout)
+                    self.results = pd.merge(self.results, plate_info, how='inner', on='well', sort=False)
+                self.results.set_index(np.arange(1, len(self.results.index)+1), inplace=True)
+        else:
+            return None
+
+        if save:  # this is either the first results file or a new one with more data
             output_name = os.path.join(self.out_dir, (self.name + '_output.xlsx'))
+            i = 0
+            while os.path.exists(output_name):
+                i += 1
+                output_name = os.path.join(self.out_dir, (self.name + '_output' + str(i) + '.xlsx'))
             output_file = pd.ExcelWriter(output_name, engine='xlsxwriter', datetime_format='mmm d yyyy')
             self.results.to_excel(output_file)
             output_file.close()
@@ -152,23 +199,23 @@ class OD_growth_experiment(object):
             return plt.show()
 
     def plot_heatmap(self, show=True, save=False, metric='growth rate', unit=None):
-        # only works if sample names are well IDs
 
         if self.results['row'].max() > 8 or self.results['column'].max() > 12:
             results_arr = np.empty((16, 24))  # assume 384-well plate
             results_arr.fill(np.nan)
+            indices=['A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P']
+            columns=range(1,25)
         else:
             results_arr = np.empty((8, 12))  # assume 96-well plate
             results_arr.fill(np.nan)
+            indices=['A','B','C','D','E','F','G','H']
+            columns=range(1,13)
 
         results_arr[(self.results['row']-1), (self.results['column']-1)] = self.results[metric]
 
         # only show if not saved?
-        data = pd.DataFrame(results_arr, index=['A','B','C','D','E','F','G','H'], columns=range(1,13))
-        #sns.set_style('darkgrid')
-        #if self.organism is 'yeast': max = 0.015  # about 60 minutes doubling time only valid for growth rate metric
-        #elif self.organism is 'bacteria': max = 0.05  # about 15 minutes doubling time
-        #else: max = None  # infer from data
+        data = pd.DataFrame(results_arr, index=indices, columns=columns)
+        # TODO: optional input for min/max values of heatmap? outliers can greatly distort scale
         fig = sns.heatmap(data, vmin = 0, cmap='spring_r', linewidths=0.01)
         plt.yticks(rotation=0)
         fig.xaxis.set_ticks_position('top')
@@ -182,41 +229,6 @@ class OD_growth_experiment(object):
 
         if show:
             return plt.show()
-
-    def effective_growth_rate(self, start=0, end=None, save=False):  # calculate and make dataframe
-        # get start and end times, reformat if necessary
-        if end is None: end = self.elapsed_time[-1]
-        if type(start) not in [int, float]:  # if numeric, assume minutes
-            start = reformat_time(datetime.datetime.strptime(start, '%H:%M:%S').time()) #.astype(datetime.time)) #time.strptime(start, '%H:%M:%S'))
-        if type(end) not in [int, float]:  # if numeric, assume minutes
-            end = reformat_time(datetime.datetime.strptime(end, '%H:%M:%S').time()) #end.astype(datetime.time)) #time.strptime(end, '%H:%M:%S'))
-        time_change = end - start
-        # get indices of start and end times in self.elapsed_time list:
-        start_index = self.elapsed_time.index(start)
-        end_index = self.elapsed_time.index(end)
-        # now get ODs and calculate for each sample
-        effective_rates = {}
-        for sample in self.samples.itervalues():
-            start_logOD = sample.log_data[start_index]
-            end_logOD = sample.log_data[end_index]
-            logOD_change = end_logOD - start_logOD
-            effective_gr = logOD_change/time_change
-            doubling_time = np.log(2)/effective_gr
-            effective_rates[sample.name] = [effective_gr, doubling_time]
-
-        eff_data = pd.DataFrame.from_dict(effective_rates, orient='index')
-        eff_data.columns = ['effective growth rate', 'effective doubling time']
-        eff_data.sort_index(inplace=True)
-
-        if save:
-            start_to_end = str(start) + '-' + str(end)
-            output_name = os.path.join(self.out_dir, (self.name + '_eff_growth_' + start_to_end + '.xlsx'))
-            output_file = pd.ExcelWriter(output_name, engine='xlsxwriter')
-            eff_data.to_excel(output_file)
-            output_file.close()
-
-        return eff_data
-
 
 class Sample(object):  # create Sample class for attributes collected for each column of data
 
@@ -283,8 +295,8 @@ class Sample(object):  # create Sample class for attributes collected for each c
         for i in range(0, num_windows):
             window_times = self.elapsed_time[i:i+window_size]
             sub_data = data[i:i+window_size]
-            if masked and sub_data.count() < window_size:  # require more than two unmasked points for linear regression
-                results = [None, None]
+            if masked and sub_data.count() < window_size:  # exclude windows with masked values
+                results = [np.nan, np.nan]
             else:
                 results = stats.mstats.linregress(window_times, sub_data)  # get fit parameters - this takes a while...
             rates.append(results[0])
@@ -342,7 +354,9 @@ class Sample(object):  # create Sample class for attributes collected for each c
             #self.lag_OD = self.growth_rate*self.lag_time + self.intercept
             interval = self.elapsed_time[1] - self.elapsed_time[0]
             self.lag_index = int(self.lag_time/interval)
-            self.lag_OD = self.raw_data[self.lag_index]
+            if self.lag_index < len(self.raw_data):
+                self.lag_OD = self.raw_data[self.lag_index]
+            else: self.lag_index, self.lag_time, self.lag_OD = None, None, None
         else: self.lag_index, self.lag_time, self.lag_OD = None, None, None
 
         rates, intercepts, window_size = self.sliding_window(data=self.raw_data)
@@ -378,6 +392,26 @@ class Sample(object):  # create Sample class for attributes collected for each c
         # now compute rate from sliding window using smoothed data points
         self.get_max_growth_parameters(self.smooth_log_data, droplow)
         self.get_lag_sat_parameters()
+
+    def effective_growth_rate(self, start=0, end=None):  # calculate for passed sample
+        if end is None:
+            end = self.elapsed_time[-1]
+        if type(start) not in [int, float]:  # if numeric, assume minutes
+            start = reformat_time(datetime.datetime.strptime(start, '%H:%M:%S').time())
+        if type(end) not in [int, float]:  # if numeric, assume minutes
+            end = reformat_time(datetime.datetime.strptime(end, '%H:%M:%S').time())
+
+        # get indices of start and end times in self.elapsed_time list:
+        start_index = self.elapsed_time.index(start)
+        end_index = self.elapsed_time.index(end)
+        time_change = end - start
+
+        # now get ODs and calculate for each sample
+        start_logOD = self.log_data[start_index]
+        end_logOD = self.log_data[end_index]
+        logOD_change = end_logOD - start_logOD
+        self.effective_gr = logOD_change/time_change
+        self.effective_dt = np.log(2)/self.effective_gr
 
     def plot_growth_parameters(self, show=True, save=False, folder='./'):
         #  Default show/save assumes that showing plot is desired if function is called for one sample
@@ -425,21 +459,19 @@ class Sample(object):  # create Sample class for attributes collected for each c
 
 
 def analyze_experiment(
-        data_file, plate_layout=None, blank=0, method='smooth_n_slide', organism='yeast',
+        data_file, plate_layout=None, blank=0, method='sliding_window', organism='yeast',
         sample_plots=False, out_dir='./', s=0.1, droplow=False):
     experiment = OD_growth_experiment(data_file, plate_layout, blank, organism, out_dir)
     print "initialized experiment"
-    experiment.create_sample_list()
-    print "created sample list"
     experiment.analyze_sample_data(method, sample_plots, s, droplow)  # these arguments only apply to analysis
     print "analyzed samples"
     experiment.output_data(save=True)
-    print "created output data file"
+    print "created output data table"
     return experiment
 
 
-def make_plots(experiment, show=True, save=False, metric1='doubling time', unit='minutes', metric2='growth rate'):
-    experiment.plot_histogram(show, save, metric1, unit)
+def make_plots(experiment, show=True, save=False, metric1='doubling time', unit1='minutes', metric2='growth rate'):
+    experiment.plot_histogram(show, save, metric1, unit1)
     experiment.plot_heatmap(show, save, metric2)
 
 
@@ -460,7 +492,7 @@ def compute_means(experiment, metric=['growth rate'], save=False, keys=None):  #
 
     return data_calc
 
-
+# TODO: rewrite main function to reflect all inputs into above functions
 def main():  # Defaults include making all plots and saving all files
     parser = argparse.ArgumentParser(description='Specify a data file to be analyzed.')
     parser.add_argument('-f', '--data_file', required=True, help='Full path to data file.')
@@ -481,9 +513,6 @@ def main():  # Defaults include making all plots and saving all files
 
     experiment = OD_growth_experiment(data_file, plate_layout, blank, organism, out_dir)
     print "created an experiment"
-
-    experiment.create_sample_list()
-    print "input samples"
 
     experiment.analyze_sample_data(method=method, sample_plots=True)
     print "analyzed samples"
