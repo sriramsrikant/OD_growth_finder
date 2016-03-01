@@ -29,7 +29,7 @@ class OD_growth_experiment(object):
     to the experiment: blank well(s) or value, organism (determines window size for now), and output directory
     """
 
-    def __init__(self, path_to_data, plate_layout=None, blank=None, organism='yeast', out_dir='./'):
+    def __init__(self, path_to_data, plate_layout=None, blank=None, organism='yeast', window_size=None, out_dir='./'):
         self.path_to_data = path_to_data
         self.data = pd.read_excel(path_to_data)
         self.data.dropna(inplace=True, axis=1)  # Drop the rows that have NAN's, usually at the end
@@ -38,6 +38,7 @@ class OD_growth_experiment(object):
         self.results = None
 
         self.organism = organism
+        self.window_size = window_size
         self.out_dir = out_dir
         self.name = os.path.splitext(os.path.basename(path_to_data))[0]
 
@@ -49,7 +50,7 @@ class OD_growth_experiment(object):
         self.data.drop(self.data.columns[[0]], inplace=True, axis=1)  # remove time column from data to be analyzed
 
         # remove Temperature column from data
-        temp = next(c for c in self.data.columns if re.match('Temp.*', c))
+        temp = [c for c in self.data.columns if re.match('Temp.*', c)]
         if temp: self.data.drop(temp, inplace=True, axis=1)
 
         # check blank TODO: accommodate input of multiple blank wells, average value at each time point
@@ -73,6 +74,10 @@ class OD_growth_experiment(object):
     def analyze_sample_data(self, method='sliding_window', sample_plots=False, s=0.05, droplow=False, start=0, end=None):
 
         # TODO: put common calculations before sample iterator, e.g. get_window_size()
+        self.interval = self.elapsed_time[1] - self.elapsed_time[0]
+        if self.window_size is None:
+            self.window_size = self.get_window_size(self.interval)
+
         self.method = method
         if method == 'sliding_window':
             for sample in self.samples.itervalues():
@@ -106,10 +111,9 @@ class OD_growth_experiment(object):
 
         return self
 
-    def get_window_size(self):
+    def get_window_size(self, interval):
         # determine a good window size - start with 1-1.5*(wt doubling time in minutes)/(time interval in minutes)
         # determine time interval from self.elapsed_time
-        interval = self.elapsed_time[1] - self.elapsed_time[0]
         if self.organism == 'yeast':
             window_size = int(90/interval)
         elif self.organism == 'bacteria':
@@ -118,7 +122,7 @@ class OD_growth_experiment(object):
             window_size = 5
         if window_size > len(self.elapsed_time)/2:  # recalculate window size for small number of data points
             window_size = int(len(self.elapsed_time)/2)  # max window size possible is half the number of data points
-        return window_size, interval
+        return window_size
 
     def output_data(self, method=None, save=False):
 
@@ -287,7 +291,7 @@ class Sample(object):  # create Sample class for attributes collected for each c
     def sliding_window(self, data=None, masked=False):
 
         if data is None: data = self.log_data
-        window_size, interval = self.experiment.get_window_size()
+        window_size = self.experiment.window_size
 
         rates = []
         intercepts = []
@@ -327,7 +331,7 @@ class Sample(object):  # create Sample class for attributes collected for each c
             new_rate = results[0]
             if new_rate <=0 or np.isnan(new_rate):
                 self.growth_rate, self.intercept, self.maximum_index, self.time_of_max_rate, self.doubling_time, \
-                self.fit_y_values = None, None, None, None, None, None
+                    self.fit_y_values = None, None, None, None, None, None
             else:
                 self.growth_rate = new_rate
                 self.intercept = results[1]
@@ -352,8 +356,7 @@ class Sample(object):  # create Sample class for attributes collected for each c
         if self.growth_rate > 0 and lag_line[0] < self.growth_rate/4:
             self.lag_time = (lag_line[1] - self.intercept)/(self.growth_rate - lag_line[0])
             #self.lag_OD = self.growth_rate*self.lag_time + self.intercept
-            interval = self.elapsed_time[1] - self.elapsed_time[0]
-            self.lag_index = int(self.lag_time/interval)
+            self.lag_index = int(self.lag_time/self.experiment.interval)
             if self.lag_index < len(self.raw_data):
                 self.lag_OD = self.raw_data[self.lag_index]
             else: self.lag_index, self.lag_time, self.lag_OD = None, None, None
