@@ -29,7 +29,7 @@ class OD_growth_experiment(object):
     to the experiment: blank well(s) or value, organism (determines window size for now), and output directory
     """
 
-    def __init__(self, path_to_data, plate_layout=None, blank=None, organism='yeast', out_dir='./', window_size=None):
+    def __init__(self, path_to_data, plate_layout=None, blank=None, organism='yeast', out_dir='./', window_size=None, blank_file=None):
         self.path_to_data = path_to_data
         self.data = pd.read_excel(path_to_data)
         self.data.dropna(inplace=True, axis=1)  # Drop the rows that have NAN's, usually at the end
@@ -64,6 +64,14 @@ class OD_growth_experiment(object):
         else:
             self.blank = blank  # assumes input is a number
 
+        self.blank_file = None
+        if blank_file:
+            self.blank_file = pd.read_excel(blank_file)
+            self.blank = {}
+            for well_str in self.blank_file.columns:
+                sample_blank = self.blank_file.loc[:, well_str].values #this should return an array of one entry
+                self.blank[well_str] = sample_blank
+
         self.create_sample_list()
         print "initialized experiment"
 
@@ -71,7 +79,11 @@ class OD_growth_experiment(object):
 
         for well_str in self.data.columns:  # well_str is name of column
             raw_data = self.data.loc[:, well_str].values  # returns numpy array
-            self.samples[well_str] = Sample(self, well_str, raw_data)
+            if self.blank_file is not None:
+                sample_blank = self.blank[well_str]
+            else:
+                sample_blank = self.blank
+            self.samples[well_str] = Sample(self, well_str, raw_data, sample_blank)
 
         return self.samples
 
@@ -230,7 +242,6 @@ class OD_growth_experiment(object):
 
         # only show if not saved?
         data = pd.DataFrame(results_arr, index=indices, columns=columns)
-        # TODO: optional input for min/max values of heatmap? outliers can greatly distort scale
         if vmin is not None:
             fig = sns.heatmap(data, vmin=vmin, vmax=vmax, cmap='spring_r', linewidths=0.01)
         else:
@@ -250,13 +261,14 @@ class OD_growth_experiment(object):
 
 class Sample(object):  # create Sample class for attributes collected for each column of data
 
-    def __init__(self, experiment, name, data):
+    def __init__(self, experiment, name, data, blank):
         self.experiment = experiment # now ref attributes as self.experiment.attr
         self.elapsed_time = self.experiment.elapsed_time
         self.out_dir = self.experiment.out_dir
         self.name = name
         self.raw_data = data
-        self.cal_data = self.raw_data - self.experiment.blank # subtract blank value, either single value or vector
+        self.blank = blank
+        self.cal_data = self.raw_data - self.blank # subtract blank value, either single value or vector
         self.log_data = np.log(self.cal_data) # Log of the calibrated OD
         # TODO: measure OD values of serial dilution, remove or underweight very low and very high values if not linear
 
@@ -532,7 +544,7 @@ class Sample(object):  # create Sample class for attributes collected for each c
                     fit_on_orig = [(np.exp(self.growth_rate * x) * np.exp(self.intercept) + self.experiment.blank[i])
                                    for i, x in enumerate(self.elapsed_time)]
                 else:
-                    fit_on_orig = [(np.exp(self.growth_rate * x) * np.exp(self.intercept) + self.experiment.blank)
+                    fit_on_orig = [(np.exp(self.growth_rate * x) * np.exp(self.intercept) + self.blank)
                                    for x in self.elapsed_time]
                 orig.plot(self.elapsed_time, fit_on_orig, 'r-', label='fit')
                 if self.time_of_max_rate is not None:
@@ -580,9 +592,9 @@ class Sample(object):  # create Sample class for attributes collected for each c
 
 
 def analyze_experiment(
-        data_file, plate_layout=None, blank=0, method='sliding_window', organism='yeast',
-        sample_plots=False, out_dir='./', window_size=None, s=0.1, droplow=False, start=None, end=None):
-    experiment = OD_growth_experiment(data_file, plate_layout, blank, organism, out_dir, window_size)
+        data_file, plate_layout=None, blank=0, method='sliding_window', organism='yeast', sample_plots=False,
+        out_dir='./', window_size=None, s=0.1, droplow=False, start=None, end=None, blank_file=None):
+    experiment = OD_growth_experiment(data_file, plate_layout, blank, organism, out_dir, window_size, blank_file)
     experiment.analyze_sample_data(method, sample_plots, s, droplow, start, end)  # these arguments only apply to analysis
     experiment.output_data(save=True)
     return experiment
