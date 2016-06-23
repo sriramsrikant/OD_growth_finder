@@ -24,18 +24,29 @@ def reformat_time(x):
     return time_in_seconds/60.  # return time in minutes for computation of doubling time in minutes
 
 
-class OD_growth_experiment(object):
+def yes_no(x):
+
+    """Returns string 'yes' or 'no' for True/False values"""
+    if x:
+        return 'yes'
+    else:
+        return 'no'
+
+
+class Experiment(object):
     """Each experiment consists of one data file, one plate_layout file (optional), and some other arguments specific
     to the experiment: blank well(s) or value, organism (determines window size for now), and output directory
     """
 
-    def __init__(self, path_to_data, plate_layout=None, blank=None, organism='yeast', out_dir='./', window_size=None, blank_file=None):
+    def __init__(self, path_to_data, plate_layout=None, blank=None, organism='yeast', out_dir='./', window_size=None,
+                 blank_file=None):
         self.path_to_data = path_to_data
         self.data = pd.read_excel(path_to_data)
         self.data.dropna(inplace=True, axis=1)  # Drop the rows that have NAN's, usually at the end
         self.samples = {}  # make this a dictionary instead
         self.plate_layout = plate_layout
         self.results = None
+        self.end = None  # only used in effective growth rate
 
         self.organism = organism
         self.window_size = window_size
@@ -64,13 +75,13 @@ class OD_growth_experiment(object):
         else:
             self.blank = blank  # assumes input is a number
 
-        self.blank_file = None
-        if blank_file:
-            self.blank_file = pd.read_excel(blank_file)
+        self.blank_file = blank_file
+        if self.blank_file:
+            blank_values = pd.read_excel(self.blank_file)
             self.blank = {}
-            for well_str in self.blank_file.columns:
-                sample_blank = self.blank_file.loc[:, well_str].values #this should return an array of one entry
-                self.blank[well_str] = sample_blank
+            for well_str in blank_values.columns:
+                sample_blank = blank_values.loc[:, well_str].values  # this should return an array of one entry
+                self.blank[well_str] = sample_blank  # blank value is different for each well
 
         self.create_sample_list()
         print "initialized experiment"
@@ -87,9 +98,13 @@ class OD_growth_experiment(object):
 
         return self.samples
 
-    def analyze_sample_data(self, method='sliding_window', sample_plots=False, s=0.05, droplow=False, start=0, end=None):
+    def analyze_sample_data(self, method='sliding_window', sample_plots=False, s=0.05,
+                            droplow=False, start=0, end=None, saturation=None):
 
         self.method = method
+        self.sample_plots = sample_plots
+        self.droplow = droplow
+
         if method == 'effective_growth_rate':
             if end is None:
                 end = self.elapsed_time[-1]
@@ -100,7 +115,7 @@ class OD_growth_experiment(object):
             self.start = start
             self.end = end
             for sample in self.samples.itervalues():
-                sample.effective_growth_rate(start=start, end=end)
+                sample.effective_growth_rate(start=start, end=end, saturation=saturation)
         else:
             self.interval = self.elapsed_time[1] - self.elapsed_time[0]
             if self.window_size is None:
@@ -109,7 +124,8 @@ class OD_growth_experiment(object):
             if method == 'sliding_window':
                 for sample in self.samples.itervalues():
                     sample.calculate_growth_parameters(droplow=droplow)
-                    sample.get_lag_sat_parameters()
+                    sample.get_lag_parameters()
+                    sample.get_sat_parameters()
             elif method == 'smooth_n_slide':
                 for sample in self.samples.itervalues():
                     sample.smooth_n_slide(s, droplow=droplow)
@@ -207,7 +223,28 @@ class OD_growth_experiment(object):
         print "created output data table"
         return self.results
 
-    #def summary(self):  # make output file describing analysis parameters and summarizing results
+    def summary(self):  # make output file describing analysis parameters and summarizing results
+
+        if self.blank_file:
+            blank = self.blank_file
+        else: blank = self.blank
+        if self.droplow:
+            dropped = "dropped calibrated values below OD 0.01\n"  # TODO: self.droplow_cutoff
+        else:
+            dropped = ""
+
+        output_file = os.path.join(self.out_dir, self.name + "_summary.txt")
+        with open(output_file, "w") as summary:
+            summary.write("Summary of growth curve analysis for {}:\n"
+                          "data file: {}\n"
+                          "layout file: {}\n"
+                          "blank values: {}\n"
+                          "analysis method: {}\n"
+                          "window size: {}\n"
+                          "created sample plots: {}\n"
+                          "{}"
+                          "".format(self.name, self.path_to_data, self.plate_layout, blank, self.method,
+                                    self.window_size, yes_no(self.sample_plots), dropped))
 
 
     def plot_histogram(self, show=True, save=False, metric='doubling time', unit='minutes'):
@@ -269,7 +306,7 @@ class Sample(object):  # create Sample class for attributes collected for each c
         self.raw_data = data
         self.blank = blank
         self.cal_data = self.raw_data - self.blank # subtract blank value, either single value or vector
-        self.log_data = np.log(self.cal_data) # Log of the calibrated OD
+        self.log_data = np.log(self.cal_data) # Log of the calibrated OD - nan if OD is negative value
         # TODO: measure OD values of serial dilution, remove or underweight very low and very high values if not linear
 
         # get max OD and time of max_OD
@@ -277,10 +314,15 @@ class Sample(object):  # create Sample class for attributes collected for each c
         self.max_OD = self.raw_data[self.max_OD_index]
         self.time_of_max_OD = self.elapsed_time[self.max_OD_index]
 
+        # initialize other attributes
+        self.lag_index, self.lag_time, self.lag_OD = None, None, None
+        self.sat_index, self.sat_time, self.sat_OD = None, None, None
+
         self.spline = None
 
     def spline_max_growth_rate(self, s, droplow=False):
 
+        ### N.B.: set parameter of -2.3 for dropping low OD values from analysis - i.e., OD 0.1###
         if droplow: data = np.where(self.log_data < -2.3, 'nan', self.log_data)
         else: data = self.log_data
         interpolator = interpolate.UnivariateSpline(self.elapsed_time, data, k=4, s=s)  #k can be 3-5
@@ -316,7 +358,8 @@ class Sample(object):  # create Sample class for attributes collected for each c
 
     def calculate_growth_parameters(self, data=None, droplow=False):
         results = self.get_max_rate(data=data, droplow=droplow)  # runs sliding window and calcs max90 rate
-        check, new_results = self.check_growth_parameters(results[0], results[2], droplow=droplow)  # check rate and r2, fit spline and recalc if r2<0.9
+        # check rate and r2, fit spline and recalc if r2<0.9
+        check, new_results = self.check_growth_parameters(results[0], results[2], droplow=droplow)
         if new_results:  # if not empty list, then spline was fit
             self.set_growth_parameters(check, new_results)
         else:
@@ -342,10 +385,11 @@ class Sample(object):  # create Sample class for attributes collected for each c
         return rates, intercepts, window_size
 
     def get_max_rate(self, data=None, droplow=False):  # run sliding window for max growth rate
-
         if data is None: data = self.log_data
+        ### N.B.: set parameter of -4.6 for dropping low OD values from analysis - i.e., OD 0.01 (very conservative) ###
+        droplow_cutoff = -4.6  # TODO: make this value an input parameter
         if droplow:
-            masked_data = np.ma.masked_less(np.copy(data), -5.0) # TODO: make this value an input parameter
+            masked_data = np.ma.masked_less(np.copy(data), droplow_cutoff)
             data = masked_data
         rates, intercepts, window_size = self.sliding_window(data=data, masked=droplow)
         self.log_rates = rates
@@ -356,10 +400,11 @@ class Sample(object):  # create Sample class for attributes collected for each c
             r2 = np.nan
             intercept, start, end = None, None, None
         else:
+            ### N.B.: set parameter of 0.9 for which values to include in determining rate ###
             max90_rates = [rates.index(i) for i in rates if i >= 0.9*maximum_rate]
             start = max90_rates[0]
             end = max90_rates[-1] + window_size - 1
-            # num_points = len(max95_rates) TODO: include start, end, and number of points in output
+            # num_points = len(max90_rates) TODO: include start, end, and number of points in output
             window_times = self.elapsed_time[start:end]
             sub_data = data[start:end]
             results = stats.mstats.linregress(window_times, sub_data)
@@ -373,11 +418,14 @@ class Sample(object):  # create Sample class for attributes collected for each c
         results = []
         if np.isnan(r2):
             check = 0
+        ### N.B.: set parameter of 0.9 for r-squared cut-off ###
         elif r2<0.9 or max_rate <=0 or np.isnan(max_rate): #check r-squared value
             # fit spline and recalc max rate
+            ### N.B.: set parameters of k=4, s=0.1 for fitting spline (see doc for interpolate.UnivariateSpline) ###
             interpolator = interpolate.UnivariateSpline(self.elapsed_time, self.log_data, k=4, s=0.1) #k can be 3-5
             self.spline = interpolator(self.elapsed_time)
             [new_rate, intercept, new_r2, start, end] = self.get_max_rate(data=self.spline, droplow=droplow)
+            ### N.B.: set parameter of 0.9 for r-squared cut-off ###
             if new_r2<0.9 or new_rate <=0 or np.isnan(new_rate):
                 check = 0
             else:
@@ -397,25 +445,29 @@ class Sample(object):  # create Sample class for attributes collected for each c
             self.r2 = results[2]
             self.start_pt = results[3]
             self.end_pt = results[4]
-            self.maximum_index = int((self.end_pt + self.start_pt)/2)  # returns midpoint of time window used to calc rate
+            self.maximum_index = int((self.end_pt + self.start_pt)/2)  # midpoint of time window used to calc rate
             self.time_of_max_rate = self.elapsed_time[self.maximum_index]
             self.doubling_time = np.log(2)/self.growth_rate
 
         self.fit_y_values = [((self.growth_rate * x) + self.intercept) for x in self.elapsed_time]
 
-    def get_lag_sat_parameters(self):  # run sliding window for raw data rates
-
+    def get_lag_parameters(self):
+        # TODO: lag time calculation needs work
         log_data = list(self.log_data)
-        first_logOD = log_data[0]
-        # find points within 0.2 on logOD scale:
+        # problem with some initial values being negative after subtracting blank
+        first_logOD = next(x for x in log_data if not np.isnan(x))  # gets first non-nan logOD value
+        # find points within 0.05 on logOD scale:
         low_ODs = []
         low_times = []
         for i, p in enumerate(log_data):
+            ### N.B.: set parameter of +/- 0.05 for which log OD values to include in lag calculation ###
             if first_logOD-0.05 <= p <= first_logOD+0.05:
                 low_ODs.append(p)
                 low_times.append(self.elapsed_time[i])
         lag_line = stats.linregress(low_times, low_ODs)
+        ### N.B.: set parameter of 1/4 for determining whether slope of lag line is "low enough" to be lag ###
         if self.growth_rate > 0 and lag_line[0] < self.growth_rate/4:
+            # find intersection of lag line and growth rate fit
             self.lag_time = (lag_line[1] - self.intercept)/(self.growth_rate - lag_line[0])
             #self.lag_OD = self.growth_rate*self.lag_time + self.intercept
             self.lag_index = int(self.lag_time/self.experiment.interval)
@@ -424,9 +476,11 @@ class Sample(object):  # create Sample class for attributes collected for each c
             else: self.lag_index, self.lag_time, self.lag_OD = None, None, None
         else: self.lag_index, self.lag_time, self.lag_OD = None, None, None
 
+    def get_sat_parameters(self):  # run sliding window for raw data rates
         if self.growth_rate > 0:
             rates, intercepts, window_size = self.sliding_window(data=self.raw_data)
             last_rate = rates[-1]
+            ### N.B.: set parameter of 1/4 for determining whether end rate is "low enough" to be saturation ###
             if last_rate < self.growth_rate/4:
                 self.sat_index = self.get_flex_point(rates, 'saturation', window_size)
                 if self.sat_index > self.maximum_index:
@@ -437,6 +491,7 @@ class Sample(object):  # create Sample class for attributes collected for each c
         else: self.sat_index, self.sat_time, self.sat_OD = None, None, None
 
     def get_flex_point(self, rates, point, window_size):  # poor man's 2nd der, find where rate is changing the fastest
+        # this works great for saturation, not so much for lag
         rate_diffs = [(rates[x]-rates[x+1]) for x in (range(0,len(rates)-1))]
         np.array(rate_diffs)
         sum_rate_diffs = np.add(rate_diffs[:-2], rate_diffs[1:-1])
@@ -449,18 +504,24 @@ class Sample(object):  # create Sample class for attributes collected for each c
         return flex_point
 
     def smooth_n_slide(self, s, droplow):
-
+        ### N.B.: set parameter of -5.0 for dropping low OD values from analysis (very conservative) ###
         if droplow: data = np.where(self.log_data < -5.0, 'nan', self.log_data)
         else: data = self.log_data
         # first get a spline:
+        ### N.B.: set parameters of k=4, s=0.1 for fitting spline (see doc for interpolate.UnivariateSpline) ###
         interpolator = interpolate.UnivariateSpline(self.elapsed_time, data, k=4, s=s) #k can be 3-5
         self.smooth_log_data = interpolator(self.elapsed_time)
 
         # now compute rate from sliding window using smoothed data points
         self.calculate_growth_parameters(data=self.smooth_log_data, droplow=droplow)
-        self.get_lag_sat_parameters()
+        self.get_lag_parameters()
+        self.get_sat_parameters()
 
-    def effective_growth_rate(self, start=0, end=None):  # calculate for passed sample
+    def effective_growth_rate(self, start=0, end=None, saturation=None):  # calculate for passed sample
+        if saturation is not None:  # get saturation point and use as end point instead
+            self.get_sat_parameters()
+            if self.sat_time < end:
+                end = self.sat_time
         if end is None:
             end = self.elapsed_time[-1]
         if type(start) not in [int, float]:  # if numeric, assume minutes
@@ -487,22 +548,6 @@ class Sample(object):  # create Sample class for attributes collected for each c
         else:
             self.effective_dt = np.log(2)/self.effective_gr
         self.effective_fit = [((self.effective_gr * x) + self.effective_int) for x in self.elapsed_time]
-
-    def two_pt_slopes(self):
-        data = self.log_data
-        times = self.elapsed_time
-
-        slopes = []
-        num_slopes = len(data)-1
-        for i in range(0, num_slopes):
-            dx = times[i+1] - times[i]
-            dy = data[i+1] - data[i]  # what does this look like if one point is masked?
-            #if masked and sub_data.count() < window_size:  # exclude points with masked values
-                #results = [np.nan, np.nan]
-            #else:
-            slopes.append(dy/dx)
-        self.slopes = slopes
-        return slopes
 
     def plot_rates_distribution(self, show=True, save=False, folder=None, rates=None):
 
@@ -534,9 +579,12 @@ class Sample(object):  # create Sample class for attributes collected for each c
         # orig.set_ylim(0,self.max_OD + 0.05)
 
         if self.experiment.method is 'effective_growth_rate':
+            end = self.experiment.end
+            orig.set_xlim(0, end)  # rescale graph
+            end_index = self.elapsed_time.index(end)
             fit_on_orig = [(np.exp(self.effective_gr * x) * np.exp(self.effective_int) + self.experiment.blank)
-                           for x in self.elapsed_time]
-            orig.plot(self.elapsed_time, fit_on_orig, 'r-', label='fit')
+                           for x in self.elapsed_time[:end_index]]
+            orig.plot(self.elapsed_time[:end_index], fit_on_orig, 'r-', label='fit')
 
         else:  # for all other methods, i.e. main calculation of growth parameters
             if self.growth_rate is not None:
@@ -558,7 +606,7 @@ class Sample(object):  # create Sample class for attributes collected for each c
 
         # log(OD) data with fit line
         logOD = fig.add_subplot(212)
-        logOD.set_ylim(-5, 0)
+        #logOD.set_ylim(-5, 0)
         logOD.plot(self.elapsed_time, self.log_data, ls='', marker='.', label='ln(OD)')
         logOD.autoscale(False)  # don't want plot rescaled for fit line
         logOD.set_xlabel('elapsed time (minutes)')
@@ -568,7 +616,8 @@ class Sample(object):  # create Sample class for attributes collected for each c
             logOD.plot(self.elapsed_time, self.spline, 'k-', label='spline')
 
         if self.experiment.method is 'effective_growth_rate':
-            logOD.plot(self.elapsed_time, self.effective_fit, 'r-', label='fit')
+            logOD.set_xlim(0, end)  # rescale graph
+            logOD.plot(self.elapsed_time[:end_index], self.effective_fit[:end_index], 'r-', label='fit')
             logOD.plot(self.elapsed_time[self.eff_start], self.log_data[self.eff_start], 'r*', label='fit region')
             logOD.plot(self.elapsed_time[self.eff_end], self.log_data[self.eff_end], 'r*')
         elif self.growth_rate is not None:
@@ -593,10 +642,12 @@ class Sample(object):  # create Sample class for attributes collected for each c
 
 def analyze_experiment(
         data_file, plate_layout=None, blank=0, method='sliding_window', organism='yeast', sample_plots=False,
-        out_dir='./', window_size=None, s=0.1, droplow=False, start=None, end=None, blank_file=None):
-    experiment = OD_growth_experiment(data_file, plate_layout, blank, organism, out_dir, window_size, blank_file)
-    experiment.analyze_sample_data(method, sample_plots, s, droplow, start, end)  # these arguments only apply to analysis
+        out_dir='./', window_size=None, s=0.1, droplow=False, start=None, end=None, blank_file=None, saturation=None):
+    experiment = Experiment(data_file, plate_layout, blank, organism, out_dir, window_size, blank_file)
+    experiment.analyze_sample_data(method, sample_plots, s, droplow, start, end, saturation)
+    # these arguments only apply to analysis
     experiment.output_data(save=True)
+    experiment.summary()
     return experiment
 
 
@@ -641,7 +692,7 @@ def main():  # Defaults include making all plots and saving all files
     method = args.method
     organism = args.organism
 
-    experiment = OD_growth_experiment(data_file, plate_layout, blank, organism, out_dir)
+    experiment = Experiment(data_file, plate_layout, blank, organism, out_dir)
     print "created an experiment"
 
     experiment.analyze_sample_data(method=method, sample_plots=True)
