@@ -19,8 +19,17 @@ sns.set_style('darkgrid')
 
 def reformat_time(x):
 
-    """Assumes x is a datetime.time object."""
-    time_in_seconds = (60.*60.*x.hour + 60*x.minute + x.second)
+    """Assumes x is a datetime.datetime or datetime.time object."""
+    if type(x) is datetime.time:
+        time_in_seconds = (60. * 60. * x.hour + 60 * x.minute + x.second)
+    elif type(x) is datetime.datetime:
+        time_in_seconds = (24 * 3600 * x.day + 60. * 60. * x.hour + 60 * x.minute + x.second)
+    elif type(x) is str:
+        x = datetime.datetime.strptime(x, '%H:%M:%S')
+        time_in_seconds = (60. * 60. * x.hour + 60 * x.minute + x.second)
+    else:
+        print 'Unrecognized time format for ' + str(x)
+
     return time_in_seconds/60.  # return time in minutes for computation of doubling time in minutes
 
 
@@ -41,8 +50,16 @@ class Experiment(object):
     def __init__(self, path_to_data, plate_layout=None, blank=None, organism='yeast', out_dir='./', window_size=None,
                  blank_file=None):
         self.path_to_data = path_to_data
-        self.data = pd.read_excel(path_to_data)
-        self.data.dropna(inplace=True, axis=1)  # Drop the rows that have NAN's, usually at the end
+        extension = os.path.splitext(path_to_data)[1]
+        if extension == '.xlsx':
+            self.data = pd.read_excel(path_to_data)
+        elif extension == '.csv':
+            self.data = pd.read_csv(path_to_data)
+        elif extension == '.txt':
+            self.data = pd.read_table(path_to_data)
+        else:
+            print 'Data file type not compatible.'
+        #self.data.dropna(inplace=True, axis=1)  # Drop the rows that have NAN's, usually at the end
         self.samples = {}  # make this a dictionary instead
         self.plate_layout = plate_layout
         self.results = None
@@ -99,11 +116,16 @@ class Experiment(object):
         return self.samples
 
     def analyze_sample_data(self, method='sliding_window', sample_plots=False, s=0.05,
-                            droplow=False, start=0, end=None, saturation=None):
+                            droplow=False, start=0, end=None, saturation=False):
 
         self.method = method
         self.sample_plots = sample_plots
         self.droplow = droplow
+
+        self.interval = self.elapsed_time[1] - self.elapsed_time[0]
+        if self.window_size is None:
+            print "determining window size"
+            self.window_size = self.get_window_size(self.interval)
 
         if method == 'effective_growth_rate':
             if end is None:
@@ -115,12 +137,9 @@ class Experiment(object):
             self.start = start
             self.end = end
             for sample in self.samples.itervalues():
+                #print sample.name  # for troubleshooting
                 sample.effective_growth_rate(start=start, end=end, saturation=saturation)
         else:
-            self.interval = self.elapsed_time[1] - self.elapsed_time[0]
-            if self.window_size is None:
-                print "determining window size"
-                self.window_size = self.get_window_size(self.interval)
             if method == 'sliding_window':
                 for sample in self.samples.itervalues():
                     sample.calculate_growth_parameters(droplow=droplow)
@@ -193,10 +212,11 @@ class Experiment(object):
 
             start_to_end = str(self.start) + '-' + str(self.end)
             eff_data = pd.DataFrame(
-                [[sample.name, sample.effective_gr, sample.effective_r2, sample.effective_dt]
+                [[sample.name, sample.effective_gr, sample.effective_r2, sample.effective_dt, sample.sat_time]
                  for sample in self.samples.itervalues()],
-                columns=('well', 'growth rate '+start_to_end, 'r-squared '+start_to_end, 'doubling time '+start_to_end))
-            if not self.results.empty:
+                columns=('well', 'growth rate '+start_to_end, 'r-squared '+start_to_end, 'doubling time '+start_to_end,
+                         'saturation time'))
+            if self.results:
                 self.results = pd.merge(self.results, eff_data, how='left', on='well', sort=False)
             else:
                 self.results = eff_data
@@ -245,7 +265,6 @@ class Experiment(object):
                           "{}"
                           "".format(self.name, self.path_to_data, self.plate_layout, blank, self.method,
                                     self.window_size, yes_no(self.sample_plots), dropped))
-
 
     def plot_histogram(self, show=True, save=False, metric='doubling time', unit='minutes'):
         # plot histogram of growth rates for entire experiment
@@ -306,8 +325,8 @@ class Sample(object):  # create Sample class for attributes collected for each c
         self.raw_data = data
         self.blank = blank
         self.cal_data = self.raw_data - self.blank # subtract blank value, either single value or vector
-        self.log_data = np.log(self.cal_data) # Log of the calibrated OD - nan if OD is negative value
-        # TODO: measure OD values of serial dilution, remove or underweight very low and very high values if not linear
+        self.cor_data = np.around(np.where(self.cal_data > 0.6, 0.2141*np.exp(1.7935*self.cal_data), self.cal_data), 3)
+        self.log_data = np.log(self.cor_data) # Log of the calibrated OD - nan if OD is negative value
 
         # get max OD and time of max_OD
         self.max_OD_index = np.argmax(self.raw_data)
@@ -315,6 +334,7 @@ class Sample(object):  # create Sample class for attributes collected for each c
         self.time_of_max_OD = self.elapsed_time[self.max_OD_index]
 
         # initialize other attributes
+        self.growth_rate = None
         self.lag_index, self.lag_time, self.lag_OD = None, None, None
         self.sat_index, self.sat_time, self.sat_OD = None, None, None
 
@@ -455,7 +475,11 @@ class Sample(object):  # create Sample class for attributes collected for each c
         # TODO: lag time calculation needs work
         log_data = list(self.log_data)
         # problem with some initial values being negative after subtracting blank
-        first_logOD = next(x for x in log_data if not np.isnan(x))  # gets first non-nan logOD value
+        try:
+            first_logOD = next(x for x in log_data if not np.isnan(x))  # gets first non-nan logOD value
+        except StopIteration:  # if all OD values are negative after subtracting blank
+            self.lag_index, self.lag_time, self.lag_OD = None, None, None
+            return
         # find points within 0.05 on logOD scale:
         low_ODs = []
         low_times = []
@@ -477,15 +501,18 @@ class Sample(object):  # create Sample class for attributes collected for each c
         else: self.lag_index, self.lag_time, self.lag_OD = None, None, None
 
     def get_sat_parameters(self):  # run sliding window for raw data rates
-        if self.growth_rate > 0:
-            rates, intercepts, window_size = self.sliding_window(data=self.raw_data)
+        # TODO: consider running this on self.cor_data instead of self.raw_data
+        if self.growth_rate > 0 or self.growth_rate is None:
+            rates, intercepts, window_size = self.sliding_window(data=self.cor_data)
             last_rate = rates[-1]
+            max_rate = np.nanmax(np.asarray(rates))
+            max_index = np.argmax(np.asarray(rates))
             ### N.B.: set parameter of 1/4 for determining whether end rate is "low enough" to be saturation ###
-            if last_rate < self.growth_rate/4:
+            if last_rate < max_rate/4:  # changed from checking against growth rate
                 self.sat_index = self.get_flex_point(rates, 'saturation', window_size)
-                if self.sat_index > self.maximum_index:
+                if self.sat_index > max_index:  # index of max_rate from raw data
                     self.sat_time = self.elapsed_time[self.sat_index]
-                    self.sat_OD = self.raw_data[self.sat_index]
+                    self.sat_OD = self.cor_data[self.sat_index]
                 else: self.sat_index, self.sat_time, self.sat_OD = None, None, None
             else: self.sat_index, self.sat_time, self.sat_OD = None, None, None
         else: self.sat_index, self.sat_time, self.sat_OD = None, None, None
@@ -517,10 +544,10 @@ class Sample(object):  # create Sample class for attributes collected for each c
         self.get_lag_parameters()
         self.get_sat_parameters()
 
-    def effective_growth_rate(self, start=0, end=None, saturation=None):  # calculate for passed sample
-        if saturation is not None:  # get saturation point and use as end point instead
+    def effective_growth_rate(self, start=0, end=None, saturation=False):  # calculate for passed sample
+        if saturation:  # get saturation point and use as end point instead
             self.get_sat_parameters()
-            if self.sat_time < end:
+            if self.sat_time is not None and self.sat_time < end:
                 end = self.sat_time
         if end is None:
             end = self.elapsed_time[-1]
@@ -532,6 +559,11 @@ class Sample(object):  # create Sample class for attributes collected for each c
         # get indices of start and end times in self.elapsed_time list:
         self.eff_start = self.elapsed_time.index(start)
         self.eff_end = self.elapsed_time.index(end)
+
+        if self.eff_end <= self.eff_start:  # usually because saturation option is True and occurs before start time
+            print 'No data between start and saturation time for well ' + str(self.name)
+            end = self.elapsed_time[-1]
+            self.eff_end = self.elapsed_time.index(end)
 
         # now get ODs and calculate for each sample - fit line to all logOD points and report r-squared value
         times = self.elapsed_time[self.eff_start:self.eff_end]
@@ -573,18 +605,20 @@ class Sample(object):  # create Sample class for attributes collected for each c
         fig = plt.figure()
         # orig data with points marked for max growth, lag time, saturation time, and max OD
         orig = fig.add_subplot(211)
-        orig.plot(self.elapsed_time, self.raw_data, ls='', marker='.', label='raw data')
+        orig.plot(self.elapsed_time, self.cor_data, ls='', marker='.', label='calibrated data')
         orig.autoscale(False)
         orig.set_ylabel('OD600')
-        # orig.set_ylim(0,self.max_OD + 0.05)
+        orig.set_ylim(0,self.max_OD + 0.1)
 
         if self.experiment.method is 'effective_growth_rate':
             end = self.experiment.end
             orig.set_xlim(0, end)  # rescale graph
             end_index = self.elapsed_time.index(end)
-            fit_on_orig = [(np.exp(self.effective_gr * x) * np.exp(self.effective_int) + self.experiment.blank)
+            fit_on_orig = [(np.exp(self.effective_gr * x) * np.exp(self.effective_int)) # + self.blank if plotting raw data
                            for x in self.elapsed_time[:end_index]]
             orig.plot(self.elapsed_time[:end_index], fit_on_orig, 'r-', label='fit')
+            if self.sat_index is not None:
+                orig.plot(self.sat_time, self.sat_OD, 'go', label='saturation time')
 
         else:  # for all other methods, i.e. main calculation of growth parameters
             if self.growth_rate is not None:
