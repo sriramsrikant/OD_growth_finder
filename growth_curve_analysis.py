@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# growth_curve_analysis.py
+# growth_curve_analysis.py rename pop-groc.py
 
 # adapted from OD_growth_finder.py created by Bryan Weinstein
 # renamed to reflect additional calculation methods and distinguish from original program
@@ -121,7 +121,7 @@ class Experiment(object):
 
         return self.samples
 
-    def analyze_sample_data(self, method='sliding_window', sample_plots=False, s=0.05, droplow=False, start=0,
+    def analyze_sample_data(self, method='sliding_window', sample_plots=False, droplow=False, start=0,
                             end=None, saturation=False):
 
         self.method = method
@@ -151,12 +151,12 @@ class Experiment(object):
                     sample.get_sat_parameters()
             elif method == 'smooth_n_slide':  # fit spline then find max rate using sliding window
                 for sample in self.samples.itervalues():
-                    sample.smooth_n_slide(s, droplow=droplow)
+                    sample.smooth_n_slide(droplow=droplow)
                     self.get_lag_parameters()
                     self.get_sat_parameters()
             elif method == 'spline':  # fit spline, max growth rate is max derivative of spline
                 for sample in self.samples.itervalues():
-                    sample.spline_max_growth_rate(s, droplow=droplow)
+                    sample.spline_max_growth_rate(droplow=droplow)
                     # function has own version of lag and sat calculations based on 2nd derivative
 
         if sample_plots:
@@ -234,13 +234,13 @@ class Experiment(object):
             self.results['column'] = self.results['well'].apply(lambda x: int(x[1:]))
             self.results.sort_values(['row','column'], inplace=True)
             if self.plate_layout is not None:
-                plate_info = pd.read_excel(self.plate_layout, converters={'strain': lambda x: str(x)})
+                plate_info = pd.read_excel(self.plate_layout) #, converters={'strain': lambda x: str(x)})
                 self.results = pd.merge(self.results, plate_info, how='inner', on='well', sort=False)
             self.results.set_index(np.arange(1, len(self.results.index)+1), inplace=True)
         else:
             return None
 
-        if save:  # this is either the first results file or a new one with more data
+        if save:  # this is either the first results file or a new one with different data
             output_name = os.path.join(self.out_dir, (self.name + '_output.xlsx'))
             i = 0
             while os.path.exists(output_name):
@@ -333,7 +333,7 @@ class Experiment(object):
 
 class Sample(object):  # create Sample class for attributes collected for each column of data
 
-    def __init__(self, experiment, name, data, blank, correction=None): # [0.6, 0.2141, 1.7935]
+    def __init__(self, experiment, name, data, blank, correction=None):  # [0.6, 0.2141, 1.7935]
         self.experiment = experiment  # now ref attributes as self.experiment.attr
         self.elapsed_time = self.experiment.elapsed_time
         self.out_dir = self.experiment.out_dir
@@ -343,7 +343,8 @@ class Sample(object):  # create Sample class for attributes collected for each c
         self.cal_data = self.raw_data - self.blank  # calibrate data by subtracting blank value
         # TODO: create input parameters for correction for nonlinear OD, make correction optional
         if correction:
-            self.cor_data = np.around(np.where(self.cal_data > 0.6, 0.2141*np.exp(1.7935*self.cal_data), self.cal_data), 3)
+            self.cor_data = np.around(np.where(self.cal_data > correction[0],
+                                               correction[1]*np.exp(correction[2]*self.cal_data), self.cal_data), 3)
         else:
             self.cor_data = self.cal_data
         self.log_data = np.log(self.cor_data)  # log of the calibrated OD - nan if OD is negative value
@@ -359,12 +360,12 @@ class Sample(object):  # create Sample class for attributes collected for each c
         self.sat_index, self.sat_time, self.sat_OD = None, None, None
         self.spline = None
 
-    def spline_max_growth_rate(self, s, droplow=False):
+    def spline_max_growth_rate(self, droplow=False):
 
         ### N.B.: set parameter of -4.6 for dropping low OD values from analysis - i.e., OD 0.01 ###
         if droplow: data = np.where(self.log_data < -4.6, 'nan', self.log_data)
         else: data = self.log_data
-        interpolator = interpolate.UnivariateSpline(self.elapsed_time, data, k=4, s=s)  #k can be 3-5
+        interpolator = interpolate.UnivariateSpline(self.elapsed_time, data, k=4, s=0.05)  #k can be 3-5
         der = interpolator.derivative()
 
         # Get the approximation of the derivative at all points
@@ -459,8 +460,8 @@ class Sample(object):  # create Sample class for attributes collected for each c
         # N.B.: set parameter of 0.9 for r-squared cut-off
         elif r2<0.9 or max_rate <=0 or np.isnan(max_rate): # check r-squared value
             # fit spline and recalc max rate
-            # N.B.: set parameters of k=4, s=0.1 for fitting spline (see doc for interpolate.UnivariateSpline)
-            interpolator = interpolate.UnivariateSpline(self.elapsed_time, self.log_data, k=4, s=0.1) #k can be 3-5
+            # N.B.: set parameters of k=4, s=0.05 for fitting spline (see doc for interpolate.UnivariateSpline)
+            interpolator = interpolate.UnivariateSpline(self.elapsed_time, self.log_data, k=4, s=0.05) #k can be 3-5
             self.spline = interpolator(self.elapsed_time)
             [new_rate, intercept, new_r2, start, end] = self.get_max_rate(data=self.spline, droplow=droplow)
             # N.B.: set parameter of 0.9 for r-squared cut-off
@@ -561,13 +562,13 @@ class Sample(object):  # create Sample class for attributes collected for each c
         else: flex_point = None
         return flex_point
 
-    def smooth_n_slide(self, s, droplow):
+    def smooth_n_slide(self, droplow):
         # N.B.: set parameter of -4.6 for dropping low OD values from analysis, i.e., OD 0.01 (very conservative)
         if droplow: data = np.where(self.log_data < -4.6, 'nan', self.log_data)
         else: data = self.log_data
         # first get a spline:
-        # N.B.: set parameters of k=4, s=0.1 for fitting spline (see doc for interpolate.UnivariateSpline)
-        interpolator = interpolate.UnivariateSpline(self.elapsed_time, data, k=4, s=s) #k can be 3-5
+        # N.B.: set parameters of k=4, s=0.05 for fitting spline (see doc for interpolate.UnivariateSpline)
+        interpolator = interpolate.UnivariateSpline(self.elapsed_time, data, k=4, s=0.05) #k can be 3-5
         self.smooth_log_data = interpolator(self.elapsed_time)
 
         # now compute rate from sliding window using smoothed data points
@@ -644,7 +645,7 @@ class Sample(object):  # create Sample class for attributes collected for each c
         if self.experiment.method is 'effective_growth_rate':
             orig.set_xlim(0, self.experiment.end)  # rescale graph
             end_index = self.elapsed_time.index(self.experiment.end) + 1
-            fit_on_orig = [(np.exp(self.effective_gr * x) * np.exp(self.effective_int)) # + self.blank if plotting raw data
+            fit_on_orig = [(np.exp(self.effective_gr * x) * np.exp(self.effective_int) + self.blank)
                            for x in self.elapsed_time[:end_index]]
             orig.plot(self.elapsed_time[:end_index], fit_on_orig, 'r-', label='fit')
             if self.sat_index is not None:
@@ -706,11 +707,10 @@ class Sample(object):  # create Sample class for attributes collected for each c
 
 
 def analyze_experiment(
-        data_file, plate_layout=None, blank=None, blank_file=None, out_dir = './', window_size = 9,
-        correction=None, method='sliding_window', sample_plots=False, s=0.05, droplow=False, start=0, end=None,
-        saturation=False):
+        data_file, plate_layout=None, blank=None, blank_file=None, method='sliding_window', out_dir='./', window_size=9,
+        sample_plots=False, droplow=False, start=0, end=None, saturation=False, correction=None):
     experiment = Experiment(data_file, plate_layout, blank, blank_file, out_dir, window_size, correction)
-    experiment.analyze_sample_data(method, sample_plots, s, droplow, start, end, saturation)
+    experiment.analyze_sample_data(method, sample_plots, droplow, start, end, saturation)
     # these arguments only apply to analysis
     experiment.output_data(save=True)
     experiment.summary()
@@ -746,11 +746,11 @@ def main():  # Defaults include making all plots and saving all files
     parser = argparse.ArgumentParser(description='Specify a data file to be analyzed.')
     parser.add_argument('-f', '--data_file', required=True,
                         help='Full path to data file.')
-    parser.add_argument('-p', '--plate_layout', default=None,
+    parser.add_argument('-l', '--plate_layout', default=None,
                         help='Full path to file with plate layout information.')
     parser.add_argument('-b', '--blank', default=None,
                         help='Either a blank value or well to calculate blank value.')
-    parser.add_argument('-bf', '--blank_file', default=None,
+    parser.add_argument('-B', '--blank_file', default=None,
                         help='A file containing blank values for each well (overrides option --blank).')
     parser.add_argument('-m', '--method', default='sliding_window',
                         help='Method used for data analysis; options are sliding_window (default), '
@@ -759,22 +759,27 @@ def main():  # Defaults include making all plots and saving all files
                         help='Full path to output directory.')
     parser.add_argument('-w', '--window', default=9,
                         help='Window size used in sliding window methods')
+    parser.add_argument('-S', '--sample_plots', default=False,
+                        help='Create sample plots')
+    parser.add_argument('-d', '--droplow', default=False,
+                        help='Drop very low values from analysis (below -4.6 after calibration, equal to OD 0.01)')
+    parser.add_argument('-s', '--start', default=0,
+                        help='Start time for effective growth rate method')
+    parser.add_argument('-e', '--end', default=None,
+                        help='End time for effective growth rate method')
+    parser.add_argument('-a', '--saturation', default=False,
+                        help='Use saturation point as end time for effective growth rate if sample saturates before '
+                             'specified end (recommended)')
+    parser.add_argument('-c', '--correction', default=None,
+                        help='Parameters for non-linear correction: input as list [A, B, C] '
+                             'where A is OD value above which correction will be applied, and '
+                             'B and C are from the exponential fit y = B * exp(C*x) of measured vs. expected OD values')
     args = parser.parse_args()
 
-    data_file = args.data_file
-    plate_layout = args.plate_layout_file # include expt date and run description here
-    blank = args.blank
-    blank_file=args.blank_file
-    out_dir = args.output_directory
-    method = args.method
-    window_size = args.window
-
-    # TODO: correction, sample_plots, s, droplow, start, end, saturation, plot options
-
-
-    experiment = Experiment(data_file, plate_layout, blank, blank_file, out_dir, window_size, correction)
-    experiment.analyze_sample_data(method=method, sample_plots=True)
-    results = experiment.output_data(save=True)
+    experiment = Experiment(args.data_file, args.plate_layout, args.blank, args.blank_file, args.out_dir,
+                            args.window_size, args.correction)
+    experiment.analyze_sample_data(args.method, args.sample_plots, args.droplow, args.start, args.end, args.saturation)
+    results = experiment.output_data()
 
     experiment.plot_histogram(results, save=True)
     experiment.plot_heatmap(results, save=True)
