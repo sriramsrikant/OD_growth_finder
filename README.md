@@ -1,5 +1,7 @@
 Forked by Sriram Srikant, from the original repository of www.github.com/nwespe. Changelog will be reported in commits and changes of consequence will be reproduced below.
 
+[20200607] Added repository to both WSL Ubuntu 18.04 and Windows 10 on SriXPS15.
+
 ---------
 From original README.md:
 
